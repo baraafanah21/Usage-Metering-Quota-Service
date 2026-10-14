@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
+import type { Request } from "express";
 import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
 
@@ -24,6 +25,11 @@ export function requestLogger(logger: Logger) {
   return pinoHttp({
     logger,
     genReqId: requestIdFor,
+    // Evaluated when the response finishes, so it sees what requireApiKey set.
+    customProps: (req) => {
+      const { accountId } = req as Request;
+      return accountId ? { accountId } : {};
+    },
     customLogLevel: (_req, res, err) => {
       if (err || res.statusCode >= 500) return "error";
       if (res.statusCode >= 400) return "warn";

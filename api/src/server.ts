@@ -1,12 +1,14 @@
 import { createServer } from "node:http";
 import { createApp } from "./app.js";
 import { ConfigError, loadConfig } from "./config.js";
+import { migrate } from "./db/migrate.js";
 import { createPool } from "./db/pool.js";
+import { seed } from "./db/seed.js";
 import { createLogger } from "./logger.js";
 
 const SHUTDOWN_TIMEOUT_MS = 10_000;
 
-function main(): void {
+async function main(): Promise<void> {
   let config;
   try {
     config = loadConfig();
@@ -20,7 +22,19 @@ function main(): void {
 
   const logger = createLogger(config.LOG_LEVEL);
   const pool = createPool({ connectionString: config.DATABASE_URL, max: config.DB_POOL_MAX }, logger);
-  const server = createServer(createApp({ pool, logger }));
+
+  // Schema and predefined plans must exist before the first request. Both are idempotent,
+  // and the migration advisory lock makes concurrent instance starts safe.
+  try {
+    await migrate(pool, logger);
+    await seed(pool, logger);
+  } catch (err) {
+    logger.fatal({ err }, "database setup failed");
+    await pool.end().catch(() => {});
+    process.exit(1);
+  }
+
+  const server = createServer(createApp({ pool, logger, adminApiKey: config.ADMIN_API_KEY }));
 
   // Bound how long one request can hold a socket (DESIGN.md §10, pool exhaustion).
   server.requestTimeout = 30_000;
@@ -67,4 +81,4 @@ function main(): void {
   process.on("SIGINT", shutdown);
 }
 
-main();
+void main();

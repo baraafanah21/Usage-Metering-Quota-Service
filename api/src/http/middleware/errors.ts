@@ -1,5 +1,5 @@
 import type { ErrorRequestHandler, Request, RequestHandler, Response } from "express";
-import { AppError } from "../../domain/errors.js";
+import { AppError, type FieldError } from "../../domain/errors.js";
 
 interface Problem {
   type: "about:blank";
@@ -7,6 +7,7 @@ interface Problem {
   status: number;
   code: string;
   detail?: string;
+  errors?: FieldError[];
   requestId: string;
 }
 
@@ -17,6 +18,7 @@ function sendProblem(req: Request, res: Response, error: AppError): void {
     status: error.status,
     code: error.code,
     ...(error.detail !== undefined && { detail: error.detail }),
+    ...(error.errors !== undefined && { errors: error.errors }),
     requestId: String(req.id),
   };
   res.status(error.status).type("application/problem+json").json(body);
