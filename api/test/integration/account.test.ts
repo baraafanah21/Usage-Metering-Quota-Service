@@ -1,7 +1,14 @@
 import request from "supertest";
 import { beforeEach, describe, expect, it } from "vitest";
 import { PLAN_IDS } from "../../src/db/seed.js";
-import { createTestAccount, expectProblem, setupTestApp, type TestAccount } from "../helpers.js";
+import {
+  ADMIN_KEY,
+  createCustomPlan,
+  createTestAccount,
+  expectProblem,
+  setupTestApp,
+  type TestAccount,
+} from "../helpers.js";
 
 const { app } = setupTestApp();
 let account: TestAccount;
@@ -29,6 +36,8 @@ describe("GET /v1/account", () => {
         version: 1,
         predefined: true,
         rules: { monthlyAllowance: 10_000, maxUnitsPerRequest: 100 },
+        createdAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+        updatedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
       },
     });
   });
@@ -60,6 +69,42 @@ describe("PUT /v1/account/plan", () => {
   it("404 PLAN_NOT_FOUND for an unknown plan, plan unchanged", async () => {
     expectProblem(await putPlan({ planId: crypto.randomUUID() }), 404, "PLAN_NOT_FOUND");
     expect((await getAccount()).body.plan.id).toBe(PLAN_IDS.starter);
+  });
+
+  it("assigns the account's own custom account plan, and GET /v1/account shows it", async () => {
+    const plan = await createCustomPlan(app, account.apiKey, {
+      scope: "account",
+      rules: { monthlyAllowance: 60, maxUnitsPerRequest: 50 },
+    });
+    expect((await putPlan({ planId: plan.id })).status).toBe(200);
+    expect((await getAccount()).body.plan).toMatchObject({
+      id: plan.id,
+      predefined: false,
+      version: 1,
+      rules: { monthlyAllowance: 60, maxUnitsPerRequest: 50 },
+    });
+  });
+
+  it("400 INVALID_PLAN_SCOPE for the account's own custom user plan", async () => {
+    const plan = await createCustomPlan(app, account.apiKey, { scope: "user" });
+    expectProblem(await putPlan({ planId: plan.id }), 400, "INVALID_PLAN_SCOPE");
+    expect((await getAccount()).body.plan.id).toBe(PLAN_IDS.starter);
+  });
+
+  it("404 PLAN_NOT_FOUND for another account's custom account plan", async () => {
+    const other = await createTestAccount(app);
+    const plan = await createCustomPlan(app, other.apiKey, { scope: "account" });
+    expectProblem(await putPlan({ planId: plan.id }), 404, "PLAN_NOT_FOUND");
+    expect((await getAccount()).body.plan.id).toBe(PLAN_IDS.starter);
+  });
+
+  it("account creation rejects a custom plan id: predefined plans only", async () => {
+    const plan = await createCustomPlan(app, account.apiKey, { scope: "account" });
+    const res = await request(app)
+      .post("/v1/admin/accounts")
+      .set("X-Admin-Key", ADMIN_KEY)
+      .send({ name: `new-${crypto.randomUUID()}`, planId: plan.id });
+    expectProblem(res, 404, "PLAN_NOT_FOUND");
   });
 
   it("400 VALIDATION_ERROR for a bad body", async () => {

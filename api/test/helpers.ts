@@ -38,6 +38,26 @@ export async function createTestAccount(
   return { id: res.body.account.id, name, apiKey: res.body.apiKey.key };
 }
 
+export interface CustomPlanInput {
+  name?: string;
+  scope: "account" | "user";
+  rules?: { monthlyAllowance?: number; maxUnitsPerRequest?: number };
+}
+
+/** Creates a custom plan owned by the key's account (unique name unless given). Returns its JSON. */
+export async function createCustomPlan(
+  app: Express,
+  apiKey: string,
+  input: CustomPlanInput,
+): Promise<{ id: string; name: string; version: number; [key: string]: unknown }> {
+  const res = await request(app)
+    .post("/v1/plans")
+    .set("X-API-Key", apiKey)
+    .send({ name: input.name ?? `plan-${crypto.randomUUID()}`, scope: input.scope, rules: input.rules ?? {} });
+  expect(res.status, JSON.stringify(res.body)).toBe(201);
+  return res.body;
+}
+
 /** Asserts the response is an application/problem+json error with the given status and code. */
 export function expectProblem(res: request.Response, status: number, code: string): void {
   expect(res.status, JSON.stringify(res.body)).toBe(status);
