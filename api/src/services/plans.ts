@@ -41,6 +41,25 @@ async function mapNameConflict<T>(name: string, scope: PlanScope, write: () => P
   }
 }
 
+/**
+ * Checks that a looked-up plan can be assigned at the given level. A plan the account
+ * can't see (unknown, or another account's custom plan) is 404, so other tenants' plan ids
+ * reveal nothing; a visible plan of the other scope is 400.
+ */
+export function requirePlanScope(plan: Plan | undefined, planId: string, scope: PlanScope): Plan {
+  if (!plan) throw planNotFound(planId);
+  if (plan.scope !== scope) {
+    const a = (s: PlanScope) => (s === "account" ? "an" : "a");
+    throw new AppError(
+      400,
+      "INVALID_PLAN_SCOPE",
+      "Plan has the wrong scope",
+      `'${plan.name}' is ${a(plan.scope)} ${plan.scope} plan; ${a(scope)} ${scope} needs ${a(scope)} ${scope} plan`,
+    );
+  }
+  return plan;
+}
+
 async function loadVisiblePlan(accountId: string, planId: string, db: Queryable): Promise<Plan> {
   const plan = await findVisiblePlan(accountId, planId, db);
   if (!plan) throw planNotFound(planId);

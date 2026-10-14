@@ -11,32 +11,18 @@ import {
   findVisiblePlan,
   type Plan,
 } from "../repositories/plans.js";
-import { planNotFound } from "./plans.js";
+import { currentMonthUsage } from "../repositories/usage.js";
+import { requirePlanScope } from "./plans.js";
 
 export interface AccountWithPlan {
   account: Account;
   plan: Plan;
+  /** Units accepted for the account in the current UTC month. */
+  usage: { month: string; used: number };
 }
 
 export interface CreatedAccount extends AccountWithPlan {
   apiKey: { id: string; key: string; prefix: string; createdAt: Date };
-}
-
-/**
- * Checks that a plan can be an account's plan. A plan the account can't see (unknown, or
- * another account's custom plan) is 404, so other tenants' plan ids reveal nothing.
- */
-function requireAccountScope(plan: Plan | undefined, planId: string): Plan {
-  if (!plan) throw planNotFound(planId);
-  if (plan.scope !== "account") {
-    throw new AppError(
-      400,
-      "INVALID_PLAN_SCOPE",
-      "Plan has the wrong scope",
-      `'${plan.name}' is a ${plan.scope} plan; an account needs an account plan`,
-    );
-  }
-  return plan;
 }
 
 async function loadAccountWithPlan(accountId: string, db: Queryable): Promise<AccountWithPlan> {
@@ -44,7 +30,8 @@ async function loadAccountWithPlan(accountId: string, db: Queryable): Promise<Ac
   const plan = account && (await findAccountPlan(accountId, db));
   // A valid API key implies the account exists (FK), so this is a should-not-happen.
   if (!account || !plan) throw new AppError(404, "ACCOUNT_NOT_FOUND", "Account not found");
-  return { account, plan };
+  const { month, accountUsed } = await currentMonthUsage(accountId, null, db);
+  return { account, plan, usage: { month, used: accountUsed } };
 }
 
 /** Creates the account and its first API key atomically: both exist, or neither does. */
@@ -56,13 +43,12 @@ export async function createAccount(
     const planId = input.planId ?? DEFAULT_ACCOUNT_PLAN_ID;
     // Predefined only: a custom plan is owned by an account, so none can exist for this
     // account before it is created, and another account's plan is never assignable.
-    const plan = requireAccountScope(await findPredefinedPlan(planId, client), planId);
+    const plan = requirePlanScope(await findPredefinedPlan(planId, client), planId, "account");
     const account = await insertAccount({ name: input.name, planId: plan.id }, client);
     const generated = generateApiKey();
     const record = await insertApiKey(account.id, generated, client);
     return {
-      account,
-      plan,
+      ...(await loadAccountWithPlan(account.id, client)),
       apiKey: {
         id: record.id,
         key: generated.key,
@@ -85,7 +71,7 @@ export async function assignAccountPlan(
 ): Promise<AccountWithPlan> {
   return withTransaction(pool, async (client) => {
     // Predefined or this account's own custom plan (invariant I7).
-    const plan = requireAccountScope(await findVisiblePlan(accountId, planId, client), planId);
+    const plan = requirePlanScope(await findVisiblePlan(accountId, planId, client), planId, "account");
     if (!(await setAccountPlan(accountId, plan.id, client))) {
       throw new AppError(404, "ACCOUNT_NOT_FOUND", "Account not found");
     }
