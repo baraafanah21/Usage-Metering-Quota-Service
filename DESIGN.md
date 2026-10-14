@@ -408,8 +408,10 @@ Plans and assignments are read **inside** the consume transaction, with no cache
 - **API key lifecycle:** generated with `crypto.randomBytes(32)`; shown **once** in the creation response; only `sha256` stored. Optional rotation: `POST /v1/account/api-keys` (new key) and `DELETE /v1/account/api-keys/:id` (revoke). Revoked keys fail immediately (cache entry removed on revoke; 30s TTL bounds staleness for multiple instances — documented).
 - **Enforcement point:** an Express `requireApiKey` middleware, mounted on the `/v1` router before every account route, resolves the key → `req.accountId` (typed through a `Request` declaration merge). A separate `requireAdminKey` middleware guards `/v1/admin`. Missing → `401 MISSING_API_KEY`; unknown/revoked → `401 INVALID_API_KEY` (same response timing; no hint which).
 - **Tenant scoping rule:** the account id **never comes from the URL or body**. Every repository function takes `accountId` as its first parameter and every query has `WHERE account_id = $1`. Users are addressed by `externalId`, resolved as `WHERE account_id = $1 AND external_id = $2`.
+- **Auth runs before routing.** `requireApiKey` is mounted on the whole `/v1` router, so an unknown path under `/v1` returns `401 MISSING_API_KEY` without a key, and `404 NOT_FOUND` only once a valid key is sent. Without a key, a caller can't use 404-vs-401 to discover which routes exist. `/v1/admin/*` has its own guard and its own 404, so it never falls through to the account-key guard.
 - **Cross-tenant access returns 404, not 403** — an account can't even learn that another account's user or plan exists.
 - **Plans:** predefined visible to all, writable by nobody; custom visible and writable only by owner; assignment checks scope + ownership.
+- **Account creation accepts only predefined plans.** `POST /v1/admin/accounts` takes `planId` only for a predefined account plan (default Starter). A custom plan is owned by an account, so none can exist for an account before that account is created, and another account's custom plan is never assignable. Switch to a custom plan afterwards with `PUT /v1/account/plan`.
 - **Mandatory tests:** missing key, garbage key, revoked key, account A reading/consuming/assigning on account B's user and plan → all rejected and nothing changes.
 
 ---
@@ -431,14 +433,14 @@ All routes under `/v1`, JSON, errors as `application/problem+json`:
 
 | Method & path                                         | Auth  | Purpose                                                                             |
 | ----------------------------------------------------- | ----- | ----------------------------------------------------------------------------------- |
-| `POST /v1/admin/accounts`                             | admin | Create account `{name, planId?}` → `{account, apiKey}` (default plan: Starter)      |
+| `POST /v1/admin/accounts`                             | admin | Create account `{name, planId?}` → `{account, apiKey}` (default Starter; predefined account plans only, §7) |
 | `GET /v1/account`                                     | key   | Account info + current plan + current-month usage                                   |
 | `PUT /v1/account/plan`                                | key   | Assign account plan `{planId}`                                                      |
 | `POST /v1/account/api-keys` / `DELETE …/:id`          | key   | Rotate keys (optional)                                                              |
 | `GET /v1/plans?scope=`                                | key   | Predefined + own custom plans                                                       |
 | `POST /v1/plans`                                      | key   | Create custom plan `{name, scope, rules: {monthlyAllowance?, maxUnitsPerRequest?}}` |
 | `GET /v1/plans/:planId`                               | key   | Plan + rules + version + how many users/accounts use it                             |
-| `PATCH /v1/plans/:planId`                             | key   | Update name/rules of a custom plan → version+1. `null` removes a rule.              |
+| `PATCH /v1/plans/:planId`                             | key   | Update name/rules of a custom plan → version+1. `null` removes a rule. No `DELETE` (§16.13). |
 | `POST /v1/users`                                      | key   | Register `{externalId, planId?}` (default plan: Basic). 409 if exists.              |
 | `GET /v1/users?limit&cursor`                          | key   | List users (keyset pagination)                                                      |
 | `GET /v1/users/:externalId`                           | key   | User + plan                                                                         |
@@ -449,6 +451,31 @@ All routes under `/v1`, JSON, errors as `application/problem+json`:
 | `GET /v1/users/:externalId/usage?month=`              | key   | User used/remaining for a month                                                     |
 | `GET /v1/requests?userId&month&decision&limit&cursor` | key   | History of decisions, newest first, keyset pagination on `id`                       |
 | `GET /health/live`, `/health/ready`, `/metrics`       | none  | Probes and Prometheus metrics                                                       |
+
+### 8.1 Error codes
+
+Every error is `application/problem+json` as shown above, with a stable `code` that callers can switch on. `VALIDATION_ERROR` also carries `errors: [{ path, message }]`, one entry per bad field (for example `body.rules.monthlyAllowance`).
+
+| Code                     | Status | Meaning                                                                                       |
+| ------------------------ | ------ | --------------------------------------------------------------------------------------------- |
+| `VALIDATION_ERROR`       | 400    | Body, path or query failed validation (wrong type, out of range, unknown or forbidden field). |
+| `INVALID_JSON`           | 400    | The body is not valid JSON.                                                                   |
+| `INVALID_PLAN_SCOPE`     | 400    | The plan exists but has the wrong scope for this assignment (for example a user plan for an account). |
+| `MISSING_API_KEY`        | 401    | No `X-API-Key` header on a `/v1` route (including unknown `/v1` paths, §7).                   |
+| `INVALID_API_KEY`        | 401    | The key is malformed, unknown or revoked. Same answer for all three.                          |
+| `MISSING_ADMIN_KEY`      | 401    | No `X-Admin-Key` header on a `/v1/admin` route.                                               |
+| `INVALID_ADMIN_KEY`      | 401    | The admin key does not match `ADMIN_API_KEY`.                                                 |
+| `PLAN_READ_ONLY`         | 403    | Attempt to change a predefined plan.                                                          |
+| `NOT_FOUND`              | 404    | No such route.                                                                                |
+| `PLAN_NOT_FOUND`         | 404    | No plan with that id visible to this account: unknown, or another account's custom plan.      |
+| `ACCOUNT_NOT_FOUND`      | 404    | The authenticated account no longer exists. Should not happen; accounts aren't deleted.       |
+| `PLAN_NAME_TAKEN`        | 409    | This account already has a plan of that scope with that name (case-insensitive).              |
+| `PAYLOAD_TOO_LARGE`      | 413    | Body over the 100 kB limit.                                                                   |
+| `UNSUPPORTED_MEDIA_TYPE` | 415    | Body encoding or charset not supported.                                                       |
+| `INTERNAL_ERROR`         | 500    | Unexpected server error. Details are logged under the `requestId`, never returned.           |
+| `SERVICE_UNAVAILABLE`    | 503    | Database unreachable or not migrated (also returned by `/health/ready`).                      |
+
+Planned for later phases: `USER_NOT_FOUND` (404), `USER_EXISTS` (409), `IDEMPOTENCY_CONFLICT` (409), `BUSY` (503, lock or statement timeout, §10).
 
 **Pagination:** keyset (`WHERE id < $cursor ORDER BY id DESC LIMIT $n+1`), opaque base64 cursor, `limit` ≤ 100. Offset pagination was rejected because it gets slower as history grows and skips/duplicates rows when new requests arrive during paging.
 
@@ -574,9 +601,9 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 │   ├── Dockerfile
 │   ├── src/
 │   │   ├── server.ts / app.ts / config.ts
-│   │   ├── http/{middleware/{auth.ts, validate.ts, errors.ts}, routes/*.ts, schemas/*.ts}
+│   │   ├── http/{middleware/{auth.ts, validate.ts, errors.ts}, routes/*.ts, schemas/*.ts, views.ts}
 │   │   ├── services/{consume.ts, plans.ts, users.ts, usage.ts, accounts.ts}
-│   │   ├── domain/{rules.ts, month.ts, errors.ts}
+│   │   ├── domain/{rules.ts, month.ts, errors.ts, apiKeys.ts}
 │   │   ├── repositories/{plans.ts, users.ts, usage.ts, requests.ts, accounts.ts, apiKeys.ts}
 │   │   └── db/{pool.ts, tx.ts, migrate.ts, seed.ts, migrations/001_init.sql}
 │   └── test/{unit, integration, concurrency}
@@ -601,7 +628,7 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 10. **Allowance reduced below usage** → remaining 0, further requests rejected at that level until the next month or an increase.
 11. **Plan switch mid-month** keeps consumed units; the new plan's limits are compared against the same counter.
 12. **Predefined plans are read-only** and visible to everyone; custom plans are private to their account.
-13. **Plans cannot be deleted** while assigned (`409 PLAN_IN_USE`); deleting unused custom plans is optional.
+13. **Plans are never deleted**, and there is no `DELETE` endpoint. Every ledger row references the plan and version it was evaluated against (`account_plan_id`, `user_plan_id`), so deleting a plan would either break those references or force a cascade that rewrites history. Keeping plans forever also means an assignment can never race with a delete. An unused custom plan simply stays unassigned.
 14. **Users are not deleted** (history must be preserved); out of scope.
 15. **Past-month remaining** is reported against the currently assigned plan; the historically applied limits are in each ledger entry.
 
