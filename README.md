@@ -2,7 +2,7 @@
 
 An HTTP service that decides, before an application processes a unit of work, whether an account and one of its users still have quota for it. Each account and each user has a plan (a monthly allowance and a per-request limit). A consume call is accepted only if both levels pass, and every decision goes into a ledger. It is built with TypeScript, Express 5 and PostgreSQL 16, and correctness under concurrency is enforced by the database. See [DESIGN.md](DESIGN.md) for the full design. It is the source of truth for this project.
 
-> Status: Phase 2a. Schema, predefined plans, accounts, API keys and auth exist so far. See [DESIGN.md §18](DESIGN.md#18-build-order).
+> Status: Phase 2b. Schema, predefined and custom plans, accounts, API keys and auth exist so far. See [DESIGN.md §18](DESIGN.md#18-build-order).
 
 ## Run it
 
@@ -21,7 +21,13 @@ The API listens on `localhost:3000`. On startup it applies database migrations a
 | `GET /health/ready`          | none          | 200 if the database answers and the latest migration is applied, else 503 |
 | `POST /v1/admin/accounts`    | `X-Admin-Key` | Create an account `{ name, planId? }`; returns its first API key, once |
 | `GET /v1/account`            | `X-API-Key`   | The caller's account and its current plan                      |
-| `PUT /v1/account/plan`       | `X-API-Key`   | Switch to another predefined account plan `{ planId }`         |
+| `PUT /v1/account/plan`       | `X-API-Key`   | Switch to a predefined or own custom account plan `{ planId }` |
+| `GET /v1/plans?scope=`       | `X-API-Key`   | Predefined plans + this account's custom plans                 |
+| `POST /v1/plans`             | `X-API-Key`   | Create a custom plan `{ name, scope, rules: { monthlyAllowance?, maxUnitsPerRequest? } }` |
+| `GET /v1/plans/:planId`      | `X-API-Key`   | One plan + how many of this account's account/users use it     |
+| `PATCH /v1/plans/:planId`    | `X-API-Key`   | Change a custom plan's name/rules (`null` removes a rule); version +1 |
+
+Plans are never deleted (see [DESIGN.md §16](DESIGN.md#16-product-assumptions-to-copy-into-the-readme)). New accounts can start only on a predefined plan. A missing rule means unlimited, and a limit of `0` blocks consumption.
 
 ### Try it
 
@@ -39,6 +45,16 @@ curl -s localhost:3000/v1/account -H "X-API-Key: mk_…"
 # Switch to Pro
 curl -s -X PUT localhost:3000/v1/account/plan -H "X-API-Key: mk_…" \
   -H 'Content-Type: application/json' -d '{"planId":"00000000-0000-4000-8000-00000000a002"}'
+
+# Create a custom account plan, then assign it
+curl -s -X POST localhost:3000/v1/plans -H "X-API-Key: mk_…" -H 'Content-Type: application/json' \
+  -d '{"name":"Demo Team","scope":"account","rules":{"monthlyAllowance":60,"maxUnitsPerRequest":50}}'
+curl -s -X PUT localhost:3000/v1/account/plan -H "X-API-Key: mk_…" \
+  -H 'Content-Type: application/json' -d '{"planId":"<id from above>"}'
+
+# Raise its allowance; every account/user on the plan gets it from the next request
+curl -s -X PATCH localhost:3000/v1/plans/<id> -H "X-API-Key: mk_…" \
+  -H 'Content-Type: application/json' -d '{"rules":{"monthlyAllowance":200}}'
 ```
 
 Predefined plan ids (fixed, from [`api/src/db/seed.ts`](api/src/db/seed.ts)):
@@ -50,7 +66,7 @@ Predefined plan ids (fixed, from [`api/src/db/seed.ts`](api/src/db/seed.ts)):
 | Basic   | user    | `00000000-0000-4000-8000-00000000b001` | 1,000   | 20            |
 | Premium | user    | `00000000-0000-4000-8000-00000000b002` | 5,000   | 100           |
 
-Errors are `application/problem+json` with a stable `code` (for example `MISSING_API_KEY`, `INVALID_API_KEY`, `VALIDATION_ERROR` with an `errors` list, `PLAN_NOT_FOUND`) and the `requestId`.
+Errors are `application/problem+json` with a stable `code` and the `requestId`. The full list of codes is in [DESIGN.md §8.1](DESIGN.md#81-error-codes).
 
 ## Run the tests
 

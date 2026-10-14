@@ -7,6 +7,7 @@ import { requestLogger } from "./http/middleware/requestLogger.js";
 import { accountRouter } from "./http/routes/account.js";
 import { adminRouter } from "./http/routes/admin.js";
 import { healthRouter } from "./http/routes/health.js";
+import { plansRouter } from "./http/routes/plans.js";
 
 export interface AppDeps {
   pool: Pool;
@@ -31,6 +32,7 @@ export function createApp({ pool, logger, adminApiKey }: AppDeps): Express {
   // Everything else under /v1 belongs to an account.
   v1.use(requireApiKey(pool));
   v1.use("/account", accountRouter(pool));
+  v1.use("/plans", plansRouter(pool));
   app.use("/v1", v1);
 
   app.use(notFoundHandler);

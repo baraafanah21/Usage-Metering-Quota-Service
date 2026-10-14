@@ -5,7 +5,13 @@ import { generateApiKey } from "../domain/apiKeys.js";
 import { AppError } from "../domain/errors.js";
 import { type Account, findAccount, insertAccount, setAccountPlan } from "../repositories/accounts.js";
 import { insertApiKey } from "../repositories/apiKeys.js";
-import { findAccountPlan, findPredefinedPlan, type Plan } from "../repositories/plans.js";
+import {
+  findAccountPlan,
+  findPredefinedPlan,
+  findVisiblePlan,
+  type Plan,
+} from "../repositories/plans.js";
+import { planNotFound } from "./plans.js";
 
 export interface AccountWithPlan {
   account: Account;
@@ -17,14 +23,11 @@ export interface CreatedAccount extends AccountWithPlan {
 }
 
 /**
- * The plan an account may be put on. Only predefined account plans for now.
- * TODO(phase 2b): also accept custom account plans owned by this account.
+ * Checks that a plan can be an account's plan. A plan the account can't see (unknown, or
+ * another account's custom plan) is 404, so other tenants' plan ids reveal nothing.
  */
-async function resolveAccountPlan(planId: string, db: Queryable): Promise<Plan> {
-  const plan = await findPredefinedPlan(planId, db);
-  if (!plan) {
-    throw new AppError(404, "PLAN_NOT_FOUND", "Plan not found", `No plan with id '${planId}'`);
-  }
+function requireAccountScope(plan: Plan | undefined, planId: string): Plan {
+  if (!plan) throw planNotFound(planId);
   if (plan.scope !== "account") {
     throw new AppError(
       400,
@@ -50,7 +53,10 @@ export async function createAccount(
   input: { name: string; planId?: string | undefined },
 ): Promise<CreatedAccount> {
   return withTransaction(pool, async (client) => {
-    const plan = await resolveAccountPlan(input.planId ?? DEFAULT_ACCOUNT_PLAN_ID, client);
+    const planId = input.planId ?? DEFAULT_ACCOUNT_PLAN_ID;
+    // Predefined only: a custom plan is owned by an account, so none can exist for this
+    // account before it is created, and another account's plan is never assignable.
+    const plan = requireAccountScope(await findPredefinedPlan(planId, client), planId);
     const account = await insertAccount({ name: input.name, planId: plan.id }, client);
     const generated = generateApiKey();
     const record = await insertApiKey(account.id, generated, client);
@@ -78,7 +84,8 @@ export async function assignAccountPlan(
   planId: string,
 ): Promise<AccountWithPlan> {
   return withTransaction(pool, async (client) => {
-    const plan = await resolveAccountPlan(planId, client);
+    // Predefined or this account's own custom plan (invariant I7).
+    const plan = requireAccountScope(await findVisiblePlan(accountId, planId, client), planId);
     if (!(await setAccountPlan(accountId, plan.id, client))) {
       throw new AppError(404, "ACCOUNT_NOT_FOUND", "Account not found");
     }

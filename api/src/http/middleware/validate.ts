@@ -5,6 +5,7 @@ import { AppError, type FieldError } from "../../domain/errors.js";
 interface Schemas {
   body?: z.ZodType;
   params?: z.ZodType;
+  query?: z.ZodType;
 }
 
 function toFieldErrors(error: z.ZodError, location: string): FieldError[] {
@@ -17,7 +18,7 @@ function toFieldErrors(error: z.ZodError, location: string): FieldError[] {
 }
 
 /**
- * Validates and replaces req.body / req.params with the parsed values (trimmed, typed,
+ * Validates and replaces req.body / req.params / req.query with the parsed values (trimmed, typed,
  * defaults applied). All problems are reported together as one 400 VALIDATION_ERROR.
  * Handlers read the result with the matching z.infer type.
  */
@@ -34,6 +35,12 @@ export function validate(schemas: Schemas): RequestHandler {
       const result = schemas.params.safeParse(req.params);
       if (result.success) req.params = result.data as typeof req.params;
       else errors.push(...toFieldErrors(result.error, "params"));
+    }
+    if (schemas.query) {
+      const result = schemas.query.safeParse(req.query);
+      // Express 5 exposes req.query as a getter; shadow it with the parsed value.
+      if (result.success) Object.defineProperty(req, "query", { value: result.data });
+      else errors.push(...toFieldErrors(result.error, "query"));
     }
 
     if (errors.length > 0) {
