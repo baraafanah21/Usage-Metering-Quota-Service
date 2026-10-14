@@ -39,6 +39,7 @@ describe("GET /v1/account", () => {
         createdAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
         updatedAt: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
       },
+      currentMonth: { month: new Date().toISOString().slice(0, 7), used: 0, remaining: 10_000 },
     });
   });
 });
