@@ -1,9 +1,8 @@
 import { Router } from "express";
 import type { Pool } from "pg";
 import { latestMigrationVersion } from "../../db/migrate.js";
+import { UNDEFINED_TABLE } from "../../db/errors.js";
 import { AppError } from "../../domain/errors.js";
-
-const UNDEFINED_TABLE = "42P01";
 
 export function healthRouter(pool: Pool): Router {
   const router = Router();
