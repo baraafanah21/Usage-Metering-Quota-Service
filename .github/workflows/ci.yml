@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: api
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: metering
+          POSTGRES_PASSWORD: metering
+          POSTGRES_DB: metering_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U metering -d metering_test"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 15
+
+    env:
+      TEST_DATABASE_URL: postgres://metering:metering@localhost:5432/metering_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: api/package-lock.json
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm run build
+      - run: npm test

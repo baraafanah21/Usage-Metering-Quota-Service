@@ -1,0 +1,55 @@
+name: metering
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: metering
+      POSTGRES_PASSWORD: metering
+      POSTGRES_DB: metering
+    volumes:
+      - db-data:/var/lib/postgresql/data
+    # No host port: the api reaches it on the compose network.
+    # For a shell: docker compose exec db psql -U metering
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metering -d metering"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+  api:
+    build: ./api
+    environment:
+      DATABASE_URL: postgres://metering:metering@db:5432/metering
+      PORT: "3000"
+      # Dev-only default so a fresh clone starts; set ADMIN_API_KEY in .env for anything real.
+      ADMIN_API_KEY: ${ADMIN_API_KEY:-dev-admin-key-change-me-0123456789abcdef}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DB_POOL_MAX: ${DB_POOL_MAX:-20}
+    ports:
+      - "3000:3000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Separate, disposable database for the test suite:
+  #   docker compose --profile test up -d db-test
+  db-test:
+    image: postgres:16
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: metering
+      POSTGRES_PASSWORD: metering
+      POSTGRES_DB: metering_test
+    ports:
+      - "127.0.0.1:5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U metering -d metering_test"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+
+volumes:
+  db-data:
