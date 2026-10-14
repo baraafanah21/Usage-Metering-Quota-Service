@@ -58,6 +58,17 @@ export async function createCustomPlan(
   return res.body;
 }
 
+/** Registers a user under the key's account. Returns the response body. */
+export async function createTestUser(
+  app: Express,
+  apiKey: string,
+  body: { externalId: string; planId?: string },
+): Promise<{ externalId: string; plan: { id: string; name: string } }> {
+  const res = await request(app).post("/v1/users").set("X-API-Key", apiKey).send(body);
+  expect(res.status, JSON.stringify(res.body)).toBe(201);
+  return res.body;
+}
+
 /** Asserts the response is an application/problem+json error with the given status and code. */
 export function expectProblem(res: request.Response, status: number, code: string): void {
   expect(res.status, JSON.stringify(res.body)).toBe(status);
