@@ -188,6 +188,8 @@ CREATE TABLE user_monthly_usage (
   FOREIGN KEY (user_id, account_id) REFERENCES users(id, account_id)  -- user can't leak across accounts
 );
 CREATE INDEX user_usage_by_account_month ON user_monthly_usage (account_id, month);
+-- Added in migration 002 for GET /v1/users keyset pagination (§8.2):
+-- CREATE INDEX users_account_created ON users (account_id, created_at, id);
 
 CREATE TABLE usage_requests (               -- append-only ledger
   id                bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -441,11 +443,11 @@ All routes under `/v1`, JSON, errors as `application/problem+json`:
 | `POST /v1/plans`                                      | key   | Create custom plan `{name, scope, rules: {monthlyAllowance?, maxUnitsPerRequest?}}` |
 | `GET /v1/plans/:planId`                               | key   | Plan + rules + version + how many users/accounts use it                             |
 | `PATCH /v1/plans/:planId`                             | key   | Update name/rules of a custom plan → version+1. `null` removes a rule. No `DELETE` (§16.13). |
-| `POST /v1/users`                                      | key   | Register `{externalId, planId?}` (default plan: Basic). 409 if exists.              |
-| `GET /v1/users?limit&cursor`                          | key   | List users (keyset pagination)                                                      |
+| `POST /v1/users`                                      | key   | Register `{externalId, planId?}` (default plan: Basic; user-scope plans only). 409 if exists. |
+| `GET /v1/users?limit&cursor`                          | key   | List users (keyset pagination, §8.2) → `{ users, nextCursor }`                      |
 | `GET /v1/users/:externalId`                           | key   | User + plan                                                                         |
 | `PUT /v1/users/:externalId/plan`                      | key   | Assign user plan `{planId}`                                                         |
-| `GET /v1/users/:externalId/limits`                    | key   | **Effective limits now:** account plan + user plan + remaining at both levels       |
+| `GET /v1/users/:externalId/limits`                    | key   | **Effective limits now:** `{ month, account, user }`, each level `{ planId, planName, planVersion, monthlyAllowance, maxUnitsPerRequest, used, remaining }` |
 | `POST /v1/consume`                                    | key   | The decision (§6)                                                                   |
 | `GET /v1/usage?month=YYYY-MM`                         | key   | Account used/remaining + per-user breakdown (paginated)                             |
 | `GET /v1/users/:externalId/usage?month=`              | key   | User used/remaining for a month                                                     |
@@ -460,6 +462,7 @@ Every error is `application/problem+json` as shown above, with a stable `code` t
 | ------------------------ | ------ | --------------------------------------------------------------------------------------------- |
 | `VALIDATION_ERROR`       | 400    | Body, path or query failed validation (wrong type, out of range, unknown or forbidden field). |
 | `INVALID_JSON`           | 400    | The body is not valid JSON.                                                                   |
+| `INVALID_CURSOR`         | 400    | The `cursor` query parameter is not a `nextCursor` this API issued.                           |
 | `INVALID_PLAN_SCOPE`     | 400    | The plan exists but has the wrong scope for this assignment (for example a user plan for an account). |
 | `MISSING_API_KEY`        | 401    | No `X-API-Key` header on a `/v1` route (including unknown `/v1` paths, §7).                   |
 | `INVALID_API_KEY`        | 401    | The key is malformed, unknown or revoked. Same answer for all three.                          |
@@ -468,14 +471,27 @@ Every error is `application/problem+json` as shown above, with a stable `code` t
 | `PLAN_READ_ONLY`         | 403    | Attempt to change a predefined plan.                                                          |
 | `NOT_FOUND`              | 404    | No such route.                                                                                |
 | `PLAN_NOT_FOUND`         | 404    | No plan with that id visible to this account: unknown, or another account's custom plan.      |
+| `USER_NOT_FOUND`         | 404    | No user with that `externalId` in this account (including another account's user).           |
 | `ACCOUNT_NOT_FOUND`      | 404    | The authenticated account no longer exists. Should not happen; accounts aren't deleted.       |
 | `PLAN_NAME_TAKEN`        | 409    | This account already has a plan of that scope with that name (case-insensitive).              |
+| `USER_ALREADY_EXISTS`    | 409    | This account already has a user with that `externalId` (exact, case-sensitive match).        |
 | `PAYLOAD_TOO_LARGE`      | 413    | Body over the 100 kB limit.                                                                   |
 | `UNSUPPORTED_MEDIA_TYPE` | 415    | Body encoding or charset not supported.                                                       |
 | `INTERNAL_ERROR`         | 500    | Unexpected server error. Details are logged under the `requestId`, never returned.           |
 | `SERVICE_UNAVAILABLE`    | 503    | Database unreachable or not migrated (also returned by `/health/ready`).                      |
 
-Planned for later phases: `USER_NOT_FOUND` (404), `USER_EXISTS` (409), `IDEMPOTENCY_CONFLICT` (409), `BUSY` (503, lock or statement timeout, §10).
+Planned for later phases: `IDEMPOTENCY_CONFLICT` (409), `BUSY` (503, lock or statement timeout, §10).
+
+### 8.2 Users: `externalId` and pagination
+
+**`externalId`** is the caller's own identifier for its user. It is 1–200 characters from `A-Z a-z 0-9 . _ : @ -`, compared exactly (case-sensitive), and unique per account. It appears in URL paths (`/v1/users/:externalId`) and in log lines, so the charset excludes everything that would need escaping in either: no spaces, slashes, `%`, quotes or control characters. Callers with other identifiers (emails with `+`, non-ASCII names) map them to an id in this charset, for example a hash or their own database id.
+
+**`GET /v1/users`** pages in `(created_at, id)` order, oldest first, served by the index `users_account_created (account_id, created_at, id)`:
+
+- `limit` 1–100, default 20. The query fetches `limit + 1` rows to know whether there is a next page, without a `COUNT`.
+- `nextCursor` is opaque base64url of the last row's `[created_at, id]`, or `null` on the last page. The next page is `WHERE (created_at, id) > ($cursor)`.
+- `created_at` goes into the cursor as Postgres text at full microsecond precision. A JS `Date` keeps only milliseconds, and a truncated cursor would repeat or skip rows created in the same millisecond. `id` breaks ties, because rows inserted in one transaction share `now()`.
+- A cursor that does not decode to that shape → `400 INVALID_CURSOR`. The cursor is not signed: tampering can only move the position within the caller's own account, because every query is scoped by `account_id`.
 
 **Pagination:** keyset (`WHERE id < $cursor ORDER BY id DESC LIMIT $n+1`), opaque base64 cursor, `limit` ≤ 100. Offset pagination was rejected because it gets slower as history grows and skips/duplicates rows when new requests arrive during paging.
 

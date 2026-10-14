@@ -2,7 +2,7 @@
 
 An HTTP service that decides, before an application processes a unit of work, whether an account and one of its users still have quota for it. Each account and each user has a plan (a monthly allowance and a per-request limit). A consume call is accepted only if both levels pass, and every decision goes into a ledger. It is built with TypeScript, Express 5 and PostgreSQL 16, and correctness under concurrency is enforced by the database. See [DESIGN.md](DESIGN.md) for the full design. It is the source of truth for this project.
 
-> Status: Phase 2b. Schema, predefined and custom plans, accounts, API keys and auth exist so far. See [DESIGN.md §18](DESIGN.md#18-build-order).
+> Status: Phase 3a. Accounts, API keys, plans, users and effective limits exist so far; consuming units comes next. See [DESIGN.md §18](DESIGN.md#18-build-order).
 
 ## Run it
 
@@ -20,14 +20,19 @@ The API listens on `localhost:3000`. On startup it applies database migrations a
 | `GET /health/live`           | none          | 200 while the process is up                                    |
 | `GET /health/ready`          | none          | 200 if the database answers and the latest migration is applied, else 503 |
 | `POST /v1/admin/accounts`    | `X-Admin-Key` | Create an account `{ name, planId? }`; returns its first API key, once |
-| `GET /v1/account`            | `X-API-Key`   | The caller's account and its current plan                      |
+| `GET /v1/account`            | `X-API-Key`   | The caller's account, its plan, and this month's used/remaining |
 | `PUT /v1/account/plan`       | `X-API-Key`   | Switch to a predefined or own custom account plan `{ planId }` |
 | `GET /v1/plans?scope=`       | `X-API-Key`   | Predefined plans + this account's custom plans                 |
 | `POST /v1/plans`             | `X-API-Key`   | Create a custom plan `{ name, scope, rules: { monthlyAllowance?, maxUnitsPerRequest? } }` |
 | `GET /v1/plans/:planId`      | `X-API-Key`   | One plan + how many of this account's account/users use it     |
 | `PATCH /v1/plans/:planId`    | `X-API-Key`   | Change a custom plan's name/rules (`null` removes a rule); version +1 |
+| `POST /v1/users`             | `X-API-Key`   | Register a user `{ externalId, planId? }` (default Basic)       |
+| `GET /v1/users?limit&cursor` | `X-API-Key`   | List users, oldest first; pass `nextCursor` back as `cursor`   |
+| `GET /v1/users/:externalId`  | `X-API-Key`   | One user and its plan                                          |
+| `PUT /v1/users/:externalId/plan` | `X-API-Key` | Switch a user's plan `{ planId }` (usage is kept)             |
+| `GET /v1/users/:externalId/limits` | `X-API-Key` | This month's limits, used and remaining for the account and the user |
 
-Plans are never deleted (see [DESIGN.md §16](DESIGN.md#16-product-assumptions-to-copy-into-the-readme)). New accounts can start only on a predefined plan. A missing rule means unlimited, and a limit of `0` blocks consumption.
+Plans are never deleted (see [DESIGN.md §16](DESIGN.md#16-product-assumptions-to-copy-into-the-readme)). New accounts can start only on a predefined plan. A missing rule means unlimited, and a limit of `0` blocks consumption. A user's `externalId` is 1–200 characters from `A-Z a-z 0-9 . _ : @ -`, because it appears in URLs and logs.
 
 ### Try it
 
@@ -55,6 +60,13 @@ curl -s -X PUT localhost:3000/v1/account/plan -H "X-API-Key: mk_…" \
 # Raise its allowance; every account/user on the plan gets it from the next request
 curl -s -X PATCH localhost:3000/v1/plans/<id> -H "X-API-Key: mk_…" \
   -H 'Content-Type: application/json' -d '{"rules":{"monthlyAllowance":200}}'
+
+# Register users and read alice's effective limits
+curl -s -X POST localhost:3000/v1/users -H "X-API-Key: mk_…" \
+  -H 'Content-Type: application/json' -d '{"externalId":"alice"}'
+curl -s -X POST localhost:3000/v1/users -H "X-API-Key: mk_…" \
+  -H 'Content-Type: application/json' -d '{"externalId":"bob","planId":"00000000-0000-4000-8000-00000000b002"}'
+curl -s localhost:3000/v1/users/alice/limits -H "X-API-Key: mk_…"
 ```
 
 Predefined plan ids (fixed, from [`api/src/db/seed.ts`](api/src/db/seed.ts)):
