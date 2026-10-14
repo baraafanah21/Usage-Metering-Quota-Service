@@ -1,17 +1,13 @@
 import { defineConfig } from "vitest/config";
-
-// Tests always run against the separate test database (compose `db-test`, profile `test`).
-// TEST_DATABASE_URL overrides it (CI uses this); DATABASE_URL is deliberately ignored so a
-// shell pointed at the dev database can never be used by the test suite.
-const testDatabaseUrl =
-  process.env.TEST_DATABASE_URL ??
-  "postgres://metering:metering@localhost:5433/metering_test";
+import { TEST_DATABASE_URL } from "./test/testDatabase.js";
 
 export default defineConfig({
   test: {
     include: ["test/**/*.test.ts"],
+    // Migrates and seeds the test database once before any test file runs.
+    globalSetup: ["test/globalSetup.ts"],
     env: {
-      DATABASE_URL: testDatabaseUrl,
+      DATABASE_URL: TEST_DATABASE_URL,
       ADMIN_API_KEY: "test-admin-key-0123456789abcdef0123456789",
       LOG_LEVEL: "silent",
     },

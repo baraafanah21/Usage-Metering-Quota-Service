@@ -1,18 +1,10 @@
-import { pino } from "pino";
 import request from "supertest";
-import { afterAll, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 import { createApp } from "../../src/app.js";
-import { loadConfig } from "../../src/config.js";
 import { createPool } from "../../src/db/pool.js";
+import { ADMIN_KEY, logger, setupTestApp } from "../helpers.js";
 
-const config = loadConfig();
-const logger = pino({ level: "silent" });
-const pool = createPool({ connectionString: config.DATABASE_URL, max: 2 }, logger);
-const app = createApp({ pool, logger });
-
-afterAll(async () => {
-  await pool.end();
-});
+const { app } = setupTestApp();
 
 describe("GET /health/live", () => {
   it("returns 200", async () => {
@@ -23,7 +15,7 @@ describe("GET /health/live", () => {
 });
 
 describe("GET /health/ready", () => {
-  it("returns 200 when the database is up", async () => {
+  it("returns 200 when the database is up and migrated", async () => {
     const res = await request(app).get("/health/ready");
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ status: "ok" });
@@ -33,7 +25,7 @@ describe("GET /health/ready", () => {
     // Port 1 on localhost: nothing listens there, so the connection is refused immediately.
     const deadPool = createPool({ connectionString: "postgres://x:x@127.0.0.1:1/x", max: 1 }, logger);
     try {
-      const res = await request(createApp({ pool: deadPool, logger })).get("/health/ready");
+      const res = await request(createApp({ pool: deadPool, logger, adminApiKey: ADMIN_KEY })).get("/health/ready");
       expect(res.status).toBe(503);
       expect(res.headers["content-type"]).toMatch(/^application\/problem\+json/);
       expect(res.body).toMatchObject({ status: 503, code: "SERVICE_UNAVAILABLE" });
