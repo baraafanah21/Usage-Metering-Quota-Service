@@ -33,6 +33,9 @@ export interface UserWithPlans {
   user: User;
   userPlan: PlanRef;
   accountPlan: PlanRef;
+  /** First day of the current UTC month by the database clock, as 'YYYY-MM-DD' (§4.1).
+   *  now() is fixed per transaction, so inside one it never changes. */
+  month: string;
 }
 
 interface UserRow {
@@ -135,8 +138,8 @@ export async function listUsers(
 }
 
 /**
- * The user plus both plans that apply to it (its own, and its account's), with rules,
- * in one query. Phase 3b's consume reads exactly this inside its transaction.
+ * The user plus both plans that apply to it (its own, and its account's), with rules, and
+ * the current month, in one query. Consume reads exactly this inside its transaction.
  */
 export async function findUserWithPlans(
   accountId: string,
@@ -157,12 +160,14 @@ export async function findUserWithPlans(
     ap_version: number;
     ap_monthly: string | null;
     ap_per_request: string | null;
+    month: string;
   }>(
     `SELECT u.id, u.external_id, u.plan_id, u.created_at,
             up.name AS up_name, up.version AS up_version,
             ur.monthly AS up_monthly, ur.per_request AS up_per_request,
             ap.id AS ap_id, ap.name AS ap_name, ap.version AS ap_version,
-            ar.monthly AS ap_monthly, ar.per_request AS ap_per_request
+            ar.monthly AS ap_monthly, ar.per_request AS ap_per_request,
+            to_char(date_trunc('month', now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS month
      FROM users u
      JOIN accounts a ON a.id = u.account_id
      JOIN plans up ON up.id = u.plan_id
@@ -194,5 +199,6 @@ export async function findUserWithPlans(
       version: r.ap_version,
       rules: { monthlyAllowance: toLimit(r.ap_monthly), maxUnitsPerRequest: toLimit(r.ap_per_request) },
     },
+    month: r.month,
   };
 }

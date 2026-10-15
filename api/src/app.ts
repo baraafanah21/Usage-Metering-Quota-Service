@@ -6,6 +6,7 @@ import { errorHandler, notFoundHandler } from "./http/middleware/errors.js";
 import { requestLogger } from "./http/middleware/requestLogger.js";
 import { accountRouter } from "./http/routes/account.js";
 import { adminRouter } from "./http/routes/admin.js";
+import { consumeRouter } from "./http/routes/consume.js";
 import { healthRouter } from "./http/routes/health.js";
 import { plansRouter } from "./http/routes/plans.js";
 import { usersRouter } from "./http/routes/users.js";
@@ -35,6 +36,7 @@ export function createApp({ pool, logger, adminApiKey }: AppDeps): Express {
   v1.use("/account", accountRouter(pool));
   v1.use("/plans", plansRouter(pool));
   v1.use("/users", usersRouter(pool));
+  v1.use("/consume", consumeRouter(pool));
   app.use("/v1", v1);
 
   app.use(notFoundHandler);

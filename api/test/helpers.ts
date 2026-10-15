@@ -12,8 +12,8 @@ export const config = loadConfig();
 export const ADMIN_KEY = config.ADMIN_API_KEY;
 
 /** A pool and app for one test file, closed automatically after the file. */
-export function setupTestApp(): { pool: Pool; app: Express } {
-  const pool = createPool({ connectionString: config.DATABASE_URL, max: 5 }, logger);
+export function setupTestApp({ poolMax = 5 }: { poolMax?: number } = {}): { pool: Pool; app: Express } {
+  const pool = createPool({ connectionString: config.DATABASE_URL, max: poolMax }, logger);
   afterAll(() => pool.end());
   return { pool, app: createApp({ pool, logger, adminApiKey: ADMIN_KEY }) };
 }
@@ -74,4 +74,44 @@ export function expectProblem(res: request.Response, status: number, code: strin
   expect(res.status, JSON.stringify(res.body)).toBe(status);
   expect(res.headers["content-type"]).toMatch(/^application\/problem\+json/);
   expect(res.body).toMatchObject({ status, code, requestId: res.headers["x-request-id"] });
+}
+
+export interface Rules {
+  monthlyAllowance?: number;
+  maxUnitsPerRequest?: number;
+}
+
+export interface MeteredAccount extends TestAccount {
+  accountPlanId: string;
+  userPlanId: string;
+}
+
+/**
+ * A fresh account on a custom account plan with exact limits, and users on one custom user
+ * plan, so a test controls every number. Omitted rules are unlimited.
+ */
+export async function createMeteredAccount(
+  app: Express,
+  opts: { account: Rules; user: Rules; users: string[] },
+): Promise<MeteredAccount> {
+  const account = await createTestAccount(app);
+  const accountPlan = await createCustomPlan(app, account.apiKey, { scope: "account", rules: opts.account });
+  const userPlan = await createCustomPlan(app, account.apiKey, { scope: "user", rules: opts.user });
+  const res = await request(app)
+    .put("/v1/account/plan")
+    .set("X-API-Key", account.apiKey)
+    .send({ planId: accountPlan.id });
+  expect(res.status, JSON.stringify(res.body)).toBe(200);
+  for (const externalId of opts.users) {
+    await createTestUser(app, account.apiKey, { externalId, planId: userPlan.id });
+  }
+  return { ...account, accountPlanId: accountPlan.id, userPlanId: userPlan.id };
+}
+
+/** POST /v1/consume as the given account. */
+export function consumeAs(app: Express, apiKey: string, body: { userId: string; units: number; requestId?: string }) {
+  return request(app)
+    .post("/v1/consume")
+    .set("X-API-Key", apiKey)
+    .send({ requestId: body.requestId ?? crypto.randomUUID(), ...body });
 }

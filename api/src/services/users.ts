@@ -42,7 +42,7 @@ export interface EffectiveLimits {
   user: LevelLimits;
 }
 
-const userNotFound = (externalId: string) =>
+export const userNotFound = (externalId: string) =>
   new AppError(404, "USER_NOT_FOUND", "User not found", `No user '${externalId}' in this account`);
 
 /** A predefined or this account's own custom plan, and it must be user-scope (invariant I7). */
@@ -106,7 +106,7 @@ export async function assignUserPlan(
   return { user: { ...user, planId: plan.id }, plan };
 }
 
-function levelLimits(plan: PlanRef, used: number): LevelLimits {
+export function levelLimits(plan: PlanRef, used: number): LevelLimits {
   const rules = toRules(plan.rules);
   return {
     planId: plan.id,
