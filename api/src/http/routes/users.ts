@@ -7,6 +7,7 @@ import {
   getUser,
   listUsers,
 } from "../../services/users.js";
+import { getUserUsage } from "../../services/usage.js";
 import { decodeUserCursor, encodeUserCursor } from "../cursor.js";
 import { authenticatedAccountId } from "../middleware/auth.js";
 import { validate } from "../middleware/validate.js";
@@ -20,6 +21,7 @@ import {
   listUsersQuery,
   type ListUsersQuery,
 } from "../schemas/users.js";
+import { userUsageQuery, type UserUsageQuery } from "../schemas/usage.js";
 import { userListItemView, userView } from "../views.js";
 
 /** The caller's end users, addressed by their externalId. Mounted behind requireApiKey. */
@@ -64,6 +66,16 @@ export function usersRouter(pool: Pool): Router {
     const { externalId } = req.params as ExternalIdParams;
     res.json(await getEffectiveLimits(pool, authenticatedAccountId(req), externalId));
   });
+
+  router.get(
+    "/:externalId/usage",
+    validate({ params: externalIdParams, query: userUsageQuery }),
+    async (req, res) => {
+      const { externalId } = req.params as ExternalIdParams;
+      const { month } = req.query as unknown as UserUsageQuery;
+      res.json(await getUserUsage(pool, authenticatedAccountId(req), externalId, month));
+    },
+  );
 
   return router;
 }

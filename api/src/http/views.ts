@@ -1,7 +1,9 @@
 import { remaining, toRules } from "../domain/rules.js";
 import type { Plan, PlanAssignments } from "../repositories/plans.js";
+import type { LedgerEntry } from "../repositories/requests.js";
 import type { UserListItem } from "../repositories/users.js";
 import type { AccountWithPlan } from "../services/accounts.js";
+import { type ConsumeResponse, inContractOrder } from "../services/consume.js";
 import type { UserWithPlan } from "../services/users.js";
 
 // JSON shapes returned by the API. Kept separate from repository types so a column
@@ -43,6 +45,23 @@ export function userView({ user, plan }: UserWithPlan) {
     externalId: user.externalId,
     createdAt: user.createdAt.toISOString(),
     plan: planView(plan),
+  };
+}
+
+export function requestView(entry: LedgerEntry) {
+  return {
+    requestId: entry.requestId,
+    userId: entry.externalId,
+    units: entry.units,
+    decision: entry.decision,
+    // The ledger CHECK (I4) guarantees both are set exactly when rejected.
+    reason: entry.rejectScope && entry.rejectRule ? { scope: entry.rejectScope, rule: entry.rejectRule } : null,
+    month: entry.month,
+    createdAt: entry.createdAt.toISOString(),
+    accountPlan: { id: entry.accountPlanId, version: entry.accountPlanVersion },
+    userPlan: { id: entry.userPlanId, version: entry.userPlanVersion },
+    // The response stored at decision time, with the limits it was evaluated against.
+    ...(entry.evaluation !== undefined && { evaluation: inContractOrder(entry.evaluation as ConsumeResponse) }),
   };
 }
 
