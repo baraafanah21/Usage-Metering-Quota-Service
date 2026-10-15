@@ -372,7 +372,7 @@ sequenceDiagram
   RETURNING used;      -- row is now locked until COMMIT
   ```
 - **Fixed lock order: account row, then user row.** Every transaction follows it → no deadlock cycles possible.
-- **Rejections on per-request limits take no counter locks** → a misbehaving client spamming oversized requests can't slow down everyone else on the account.
+- **Rejections on per-request limits take no counter locks** → a misbehaving client spamming oversized requests can't slow down everyone else on the account. To fill `used`/`remaining` in the response, such a rejection reads both counters with a plain `SELECT` (no lock). That read is **for display only**: the decision depends only on `units` and the per-request limits, so a concurrent increment that the read misses cannot make the decision wrong. The shown numbers may be a few milliseconds stale.
 - **Rejections on monthly limits** do take the locks briefly (they had to read the counter), but write nothing to counters.
 - **Why not `SERIALIZABLE`?** It would also be correct, but under contention it aborts transactions (serialization failures) that we'd have to retry in a loop, wasting work exactly when load is highest. Pessimistic row locks give the same guarantee with queueing instead of retry storms.
 - **Why not a conditional `UPDATE … WHERE used + $u <= limit` without a lock?** It's correct for one level, but we need _both_ levels to pass atomically _and_ to explain which rule failed. With two conditional updates we'd have to roll back the first when the second fails — the transaction does that, so it's an optimization of the same design, kept for the performance phase (§11).
@@ -381,7 +381,7 @@ sequenceDiagram
 
 | Situation                                                                     | Behaviour                                                                                                                                                                                                                                              |
 | ----------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Same `requestId`, same `userId` + `units`                                     | Return the **originally stored decision** (accepted _or_ rejected), `replayed: true`, header `Idempotent-Replayed: true`. Counters untouched.                                                                                                          |
+| Same `requestId`, same `userId` + `units`                                     | Return the **originally stored decision** (accepted _or_ rejected), `replayed: true`, header `Idempotent-Replayed: true`. Counters untouched. The body is the response stored in `evaluation` at decision time, so `used`/`remaining`, plan names and versions are **as they were then, not now**. A replay answers "what did you decide for this request?", not "what is left now?" (use `GET /v1/users/:id/limits` for that). |
 | Same `requestId`, different payload                                           | `409 IDEMPOTENCY_CONFLICT`. Nothing changes.                                                                                                                                                                                                           |
 | Two identical requests **in flight at the same time**                         | Both may pass the initial SELECT. The second `INSERT` hits the unique constraint (`23505`) → its whole transaction rolls back (including its counter increment) → service re-reads the winner's row and returns it as a replay. Exactly one increment. |
 | Validation error (400), auth error (401), unknown user (404)                  | **Not recorded**; the `requestId` is not consumed, so the caller can fix and resend with the same id.                                                                                                                                                  |
@@ -475,12 +475,14 @@ Every error is `application/problem+json` as shown above, with a stable `code` t
 | `ACCOUNT_NOT_FOUND`      | 404    | The authenticated account no longer exists. Should not happen; accounts aren't deleted.       |
 | `PLAN_NAME_TAKEN`        | 409    | This account already has a plan of that scope with that name (case-insensitive).              |
 | `USER_ALREADY_EXISTS`    | 409    | This account already has a user with that `externalId` (exact, case-sensitive match).        |
+| `IDEMPOTENCY_CONFLICT`   | 409    | This `requestId` was already used in this account with a different `userId` or `units`. Nothing changes. |
 | `PAYLOAD_TOO_LARGE`      | 413    | Body over the 100 kB limit.                                                                   |
 | `UNSUPPORTED_MEDIA_TYPE` | 415    | Body encoding or charset not supported.                                                       |
 | `INTERNAL_ERROR`         | 500    | Unexpected server error. Details are logged under the `requestId`, never returned.           |
 | `SERVICE_UNAVAILABLE`    | 503    | Database unreachable or not migrated (also returned by `/health/ready`).                      |
+| `SERVICE_BUSY`           | 503    | Consume hit `lock_timeout` (2 s) or `statement_timeout` (5 s) under contention, or a deadlock twice. Nothing was committed: retry with the same `requestId`. |
 
-Planned for later phases: `IDEMPOTENCY_CONFLICT` (409), `BUSY` (503, lock or statement timeout, §10).
+All codes in use are listed above; later phases add new ones here.
 
 ### 8.2 Users: `externalId` and pagination
 
@@ -519,7 +521,7 @@ Seeding uses fixed UUIDs + `INSERT … ON CONFLICT DO NOTHING`, so restarts are 
 | Postgres down at startup                                                  | Migration runner retries with backoff; `/health/ready` = 503 until connected; compose `depends_on: condition: service_healthy`. |
 | Postgres down mid-request                                                 | `503 SERVICE_UNAVAILABLE`, transaction never committed → nothing recorded; caller retries with same `requestId` (safe).         |
 | Client timeout after we committed                                         | Caller retries with same `requestId` → gets the stored decision. **This is why idempotency exists.**                            |
-| Lock wait too long under extreme contention                               | `SET LOCAL lock_timeout = '2s'` and `statement_timeout = '5s'` → `503 BUSY`, nothing committed, retry is safe.                  |
+| Lock wait too long under extreme contention                               | `SET LOCAL lock_timeout = '2s'` and `statement_timeout = '5s'` → `503 SERVICE_BUSY`, nothing committed, retry is safe.          |
 | Deadlock                                                                  | Prevented by fixed lock order; if Postgres still reports `40P01`, the tx is retried once internally (it committed nothing).     |
 | Pool exhaustion                                                           | Bounded pool (`max` ≈ 20); Node `server.requestTimeout`; shows up in metrics as queue time.                                     |
 | Invalid input (units 0, negative, float, > 1,000,000,000, missing fields) | `400 VALIDATION_ERROR` with field details, not recorded.                                                                        |

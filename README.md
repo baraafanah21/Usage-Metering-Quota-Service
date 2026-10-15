@@ -2,7 +2,7 @@
 
 An HTTP service that decides, before an application processes a unit of work, whether an account and one of its users still have quota for it. Each account and each user has a plan (a monthly allowance and a per-request limit). A consume call is accepted only if both levels pass, and every decision goes into a ledger. It is built with TypeScript, Express 5 and PostgreSQL 16, and correctness under concurrency is enforced by the database. See [DESIGN.md](DESIGN.md) for the full design. It is the source of truth for this project.
 
-> Status: Phase 3a. Accounts, API keys, plans, users and effective limits exist so far; consuming units comes next. See [DESIGN.md §18](DESIGN.md#18-build-order).
+> Status: Phase 3b. Accounts, API keys, plans, users, effective limits and `POST /v1/consume` exist; usage and history endpoints come next. See [DESIGN.md §18](DESIGN.md#18-build-order).
 
 ## Run it
 
@@ -31,6 +31,7 @@ The API listens on `localhost:3000`. On startup it applies database migrations a
 | `GET /v1/users/:externalId`  | `X-API-Key`   | One user and its plan                                          |
 | `PUT /v1/users/:externalId/plan` | `X-API-Key` | Switch a user's plan `{ planId }` (usage is kept)             |
 | `GET /v1/users/:externalId/limits` | `X-API-Key` | This month's limits, used and remaining for the account and the user |
+| `POST /v1/consume`           | `X-API-Key`   | Decide and record `{ userId, units, requestId }`: 200 with `decision` accepted or rejected |
 
 Plans are never deleted (see [DESIGN.md §16](DESIGN.md#16-product-assumptions-to-copy-into-the-readme)). New accounts can start only on a predefined plan. A missing rule means unlimited, and a limit of `0` blocks consumption. A user's `externalId` is 1–200 characters from `A-Z a-z 0-9 . _ : @ -`, because it appears in URLs and logs.
 
@@ -67,7 +68,20 @@ curl -s -X POST localhost:3000/v1/users -H "X-API-Key: mk_…" \
 curl -s -X POST localhost:3000/v1/users -H "X-API-Key: mk_…" \
   -H 'Content-Type: application/json' -d '{"externalId":"bob","planId":"00000000-0000-4000-8000-00000000b002"}'
 curl -s localhost:3000/v1/users/alice/limits -H "X-API-Key: mk_…"
+
+# Consume: 200 either way, with decision "accepted" or "rejected" and the reason
+curl -s -X POST localhost:3000/v1/consume -H "X-API-Key: mk_…" \
+  -H 'Content-Type: application/json' -d '{"userId":"alice","units":10,"requestId":"doc-1"}'
 ```
+
+### Consume and retries
+
+`requestId` is your idempotency key, unique per account. Send the same `requestId` again (for example after a timeout) and you get the **original** decision back with `"replayed": true` and the header `Idempotent-Replayed: true`. Nothing is counted twice. The replayed body is the response as it was at decision time, not current numbers.
+
+- The same `requestId` with a different `userId` or `units` → `409 IDEMPOTENCY_CONFLICT`.
+- A `requestId` names one decision forever, including a rejection. After upgrading a plan, send a **new** `requestId` to try again.
+- `400` (invalid body), `401` and `404 USER_NOT_FOUND` are not recorded, so you can fix the call and resend the same `requestId`.
+- `503 SERVICE_BUSY` means nothing was recorded; retry with the same `requestId`.
 
 Predefined plan ids (fixed, from [`api/src/db/seed.ts`](api/src/db/seed.ts)):
 
