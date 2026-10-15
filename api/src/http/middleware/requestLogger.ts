@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
-import type { Request } from "express";
+import type { Request, Response } from "express";
 import type { Logger } from "pino";
 import { pinoHttp } from "pino-http";
 
@@ -25,10 +25,12 @@ export function requestLogger(logger: Logger) {
   return pinoHttp({
     logger,
     genReqId: requestIdFor,
-    // Evaluated when the response finishes, so it sees what requireApiKey set.
-    customProps: (req) => {
+    // Evaluated again when the response finishes, so it sees what requireApiKey set
+    // (accountId) and what the consume route recorded (decision, rejectScope, …).
+    customProps: (req, res) => {
       const { accountId } = req as Request;
-      return accountId ? { accountId } : {};
+      const decisionLog = (res as Response).locals?.decisionLog as object | undefined;
+      return { ...(accountId && { accountId }), ...decisionLog };
     },
     customLogLevel: (_req, res, err) => {
       if (err || res.statusCode >= 500) return "error";
