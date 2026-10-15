@@ -449,9 +449,9 @@ All routes under `/v1`, JSON, errors as `application/problem+json`:
 | `PUT /v1/users/:externalId/plan`                      | key   | Assign user plan `{planId}`                                                         |
 | `GET /v1/users/:externalId/limits`                    | key   | **Effective limits now:** `{ month, account, user }`, each level `{ planId, planName, planVersion, monthlyAllowance, maxUnitsPerRequest, used, remaining }` |
 | `POST /v1/consume`                                    | key   | The decision (§6)                                                                   |
-| `GET /v1/usage?month=YYYY-MM`                         | key   | Account used/remaining + per-user breakdown (paginated)                             |
-| `GET /v1/users/:externalId/usage?month=`              | key   | User used/remaining for a month                                                     |
-| `GET /v1/requests?userId&month&decision&limit&cursor` | key   | History of decisions, newest first, keyset pagination on `id`                       |
+| `GET /v1/usage?month=YYYY-MM&limit&cursor`            | key   | Account used/remaining + per-user breakdown, users paginated like `GET /v1/users` (§8.3) |
+| `GET /v1/users/:externalId/usage?month=`              | key   | User used/remaining for a month (§8.3)                                              |
+| `GET /v1/requests?userId&month&decision&include&limit&cursor` | key | History of decisions, newest first, keyset pagination on `id` (§8.4)        |
 | `GET /health/live`, `/health/ready`, `/metrics`       | none  | Probes and Prometheus metrics                                                       |
 
 ### 8.1 Error codes
@@ -471,7 +471,7 @@ Every error is `application/problem+json` as shown above, with a stable `code` t
 | `PLAN_READ_ONLY`         | 403    | Attempt to change a predefined plan.                                                          |
 | `NOT_FOUND`              | 404    | No such route.                                                                                |
 | `PLAN_NOT_FOUND`         | 404    | No plan with that id visible to this account: unknown, or another account's custom plan.      |
-| `USER_NOT_FOUND`         | 404    | No user with that `externalId` in this account (including another account's user).           |
+| `USER_NOT_FOUND`         | 404    | No user with that `externalId` in this account (including another account's user). Also for an unknown `userId` filter on `GET /v1/requests`. |
 | `ACCOUNT_NOT_FOUND`      | 404    | The authenticated account no longer exists. Should not happen; accounts aren't deleted.       |
 | `PLAN_NAME_TAKEN`        | 409    | This account already has a plan of that scope with that name (case-insensitive).              |
 | `USER_ALREADY_EXISTS`    | 409    | This account already has a user with that `externalId` (exact, case-sensitive match).        |
@@ -479,7 +479,7 @@ Every error is `application/problem+json` as shown above, with a stable `code` t
 | `PAYLOAD_TOO_LARGE`      | 413    | Body over the 100 kB limit.                                                                   |
 | `UNSUPPORTED_MEDIA_TYPE` | 415    | Body encoding or charset not supported.                                                       |
 | `INTERNAL_ERROR`         | 500    | Unexpected server error. Details are logged under the `requestId`, never returned.           |
-| `SERVICE_UNAVAILABLE`    | 503    | Database unreachable or not migrated (also returned by `/health/ready`).                      |
+| `SERVICE_UNAVAILABLE`    | 503    | Database unreachable, on any route: connection refused/reset, pool connect timeout, SQLSTATE class `08`, `57P01`–`57P03` (§10). Also "not migrated" on `/health/ready`. Retrying with the same `requestId` is safe (§10). |
 | `SERVICE_BUSY`           | 503    | Consume hit `lock_timeout` (2 s) or `statement_timeout` (5 s) under contention, or a deadlock twice. Nothing was committed: retry with the same `requestId`. |
 
 All codes in use are listed above; later phases add new ones here.
@@ -495,9 +495,59 @@ All codes in use are listed above; later phases add new ones here.
 - `created_at` goes into the cursor as Postgres text at full microsecond precision. A JS `Date` keeps only milliseconds, and a truncated cursor would repeat or skip rows created in the same millisecond. `id` breaks ties, because rows inserted in one transaction share `now()`.
 - A cursor that does not decode to that shape → `400 INVALID_CURSOR`. The cursor is not signed: tampering can only move the position within the caller's own account, because every query is scoped by `account_id`.
 
-**Pagination:** keyset (`WHERE id < $cursor ORDER BY id DESC LIMIT $n+1`), opaque base64 cursor, `limit` ≤ 100. Offset pagination was rejected because it gets slower as history grows and skips/duplicates rows when new requests arrive during paging.
+### 8.3 Usage
 
-**Past months:** `remaining` for a past month is computed against the plan **currently** assigned (documented); the exact limits applied at the time are in each ledger row's `evaluation` snapshot.
+`month` is `YYYY-MM` (UTC calendar month, §16.9). Omitted → the current month **by the database clock**, never the app clock. Anything else (`2026-13`, `2026-1`, `2026-10-01`) → `400 VALIDATION_ERROR`. A month with no data is not an error: every `used` is `0`.
+
+**`GET /v1/usage?month&limit&cursor`**
+
+```jsonc
+{
+  "month": "2026-10",
+  "account": { "planId": "…", "planName": "Starter", "monthlyAllowance": 10000, "used": 70, "remaining": 9930 },
+  "users": [
+    { "userId": "alice", "planName": "Basic",   "monthlyAllowance": 1000, "used": 50, "remaining": 950 },
+    { "userId": "dave",  "planName": "Premium", "monthlyAllowance": 5000, "used": 0,  "remaining": 5000 }
+  ],
+  "nextCursor": null
+}
+```
+
+- `users` pages exactly like `GET /v1/users` (§8.2): `(created_at, id)` order, `limit` 1–100 (default 20), the same opaque cursor. Every registered user appears, including users with no usage that month (`used: 0`).
+- **Two queries per request, whatever the page size:** the account row (plan, monthly rule and counter joined), then one query for the users page with each user's plan, monthly rule and counter joined. No query per user. The first query resolves the month, and the second reuses it, so the two can't disagree across midnight UTC.
+- `account.used` is the account counter, which equals the sum of all users' `used` (invariant I6). With more than one page, the sum is over all pages.
+- `monthlyAllowance`/`remaining` are `null` when the plan has no monthly rule (unlimited). `remaining` is never negative (§5).
+- **Past months: `remaining` is computed against the plan assigned NOW** (§16.15), not the plan that applied that month. Plans and assignments have no history table. The limits actually applied to each decision are in its ledger row (`accountPlan`/`userPlan` version and the `evaluation` snapshot, §8.4).
+
+**`GET /v1/users/:externalId/usage?month`** → `{ month, userId, planId, planName, monthlyAllowance, used, remaining }` in one query, with the same month rules. Unknown user or another account's user → `404 USER_NOT_FOUND`.
+
+### 8.4 History
+
+**`GET /v1/requests?userId&month&decision&include&limit&cursor`** → `{ requests: [...], nextCursor }`, this account's ledger only, newest first.
+
+```jsonc
+{
+  "requestId": "doc-9c11",
+  "userId": "carol",                      // externalId
+  "units": 10,
+  "decision": "rejected",
+  "reason": { "scope": "account", "rule": "monthly_allowance" },   // null when accepted
+  "month": "2026-10",
+  "createdAt": "2026-10-15T09:12:03.120Z",
+  "accountPlan": { "id": "…", "version": 3 },
+  "userPlan": { "id": "…", "version": 1 }
+  // "evaluation": { … }  only with ?include=evaluation: the consume response stored at decision time
+}
+```
+
+- **Filters** combine with AND: `userId` (externalId), `month` (`YYYY-MM`), `decision` (`accepted` | `rejected`). An unknown `userId`, or another account's user, → `404 USER_NOT_FOUND`, not an empty page, so a typo is visible.
+- `?include=evaluation` adds the stored snapshot: the exact §6.1 response body (limits, used/remaining, violations) as it was at decision time. It is left out by default so a 100-row page doesn't carry 100 full responses.
+- **Pagination:** keyset on `id` (`WHERE id < $cursor ORDER BY id DESC LIMIT $n+1`), `limit` 1–100 (default 20), `nextCursor` is opaque base64url of the last `id` (as a string: bigint), `null` on the last page. Anything else → `400 INVALID_CURSOR`. Offset pagination was rejected because it gets slower as history grows and skips/duplicates rows when new requests arrive during paging. With keyset paging a row is never returned twice. Ids are assigned at `INSERT`, not at `COMMIT`, so a request still in flight when the caller passes its id can be missing from that pass. A history read is a snapshot of committed decisions, not a feed.
+- **Indexes (§4), read in index order, so a page stops after `limit` + 1 matching rows:** `userId` (with or without other filters) → `usage_requests_user_hist`; `month` → `usage_requests_account_month`; none or `decision` → `usage_requests_account_hist` (`decision` is a filter on top).
+  - **Why the SQL looks odd:** the index columns before `id` are matched as one-value ranges (`account_id >= $1 AND account_id <= $1`) and kept in the sort key (`ORDER BY account_id, month, id DESC`). The rows and order are the same as with `=` and `ORDER BY id DESC`. With plain `=`, Postgres treats the column as a constant, so other orderings also give "id DESC". For a tenant or user with a large share of the table it then picks a backward scan of the primary key, filtering through every newer row of everyone else: measured at 30,000 rows read for one 20-row page. With a month filter it picks `account_hist` and filters 6,666 rows for an old month. With the ranges, only the intended index can produce the order.
+  - The user's `externalId` is a per-row lookup on the returned rows, not a join. A join let the planner start from `users` and probe the ledger once per user.
+  - EXPLAIN (ANALYZE) on ≥10,000 rows per account and per user is in the Phase 4 PR.
+- `decision=rejected` alone walks the account's index and filters. If rejections are rare, that reads many rows per page. A partial index can be added later if it matters; it is not needed at this scale.
 
 ---
 
@@ -519,7 +569,7 @@ Seeding uses fixed UUIDs + `INSERT … ON CONFLICT DO NOTHING`, so restarts are 
 | Failure                                                                   | Behaviour                                                                                                                       |
 | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
 | Postgres down at startup                                                  | Migration runner retries with backoff; `/health/ready` = 503 until connected; compose `depends_on: condition: service_healthy`. |
-| Postgres down mid-request                                                 | `503 SERVICE_UNAVAILABLE`, transaction never committed → nothing recorded; caller retries with same `requestId` (safe).         |
+| Postgres down mid-request                                                 | `503 SERVICE_UNAVAILABLE` on **every** route (problem+json; the full error is logged under the request id, never returned). The error middleware maps connectivity failures: connection refused/reset (`ECONNREFUSED`, `ECONNRESET`, …), pool/client connect timeout, connection terminated unexpectedly, SQLSTATE class `08` (connection exception) and `57P01`–`57P03` (admin/crash shutdown, cannot connect now). A transaction whose connection dies is rolled back by Postgres, so nothing is recorded and a retry with the same `requestId` is safe. The one unknowable case is a connection lost **during `COMMIT`**: the decision may or may not be stored. A retry with the same `requestId` is still safe, because idempotency (§6.4) returns the stored decision if it was committed, or decides it fresh if not. `withTransaction` keeps an `error` listener on its checked-out client: pg-pool removes its own while a client is checked out, and pg emits `error` when the server ends the session, which would otherwise crash the process. |
 | Client timeout after we committed                                         | Caller retries with same `requestId` → gets the stored decision. **This is why idempotency exists.**                            |
 | Lock wait too long under extreme contention                               | `SET LOCAL lock_timeout = '2s'` and `statement_timeout = '5s'` → `503 SERVICE_BUSY`, nothing committed, retry is safe.          |
 | Deadlock                                                                  | Prevented by fixed lock order; if Postgres still reports `40P01`, the tx is retried once internally (it committed nothing).     |
@@ -566,6 +616,10 @@ Results table per iteration: RPS, p50/p95/p99, error rate, invariant check ✅/�
 - One hot account is bounded by single-row lock throughput (thousands/s, not millions). The real-world fix is **pre-allocating quota slices** to users/instances or sharded counters — out of scope and explained, not built.
 - Ledger grows forever → monthly partitioning of `usage_requests` is the next step.
 
+### 11.5 Evidence: the counter row lock is load-bearing
+
+Recorded in Phase 3b as a mutation check on the concurrency test "allowance 100, 10 users, 50 parallel requests of 5 units" (`test/concurrency/consume.test.ts`). With the row lock on the counters removed, the runs accepted **36–37 of the 50 requests: 180–185 units against an allowance of 100**. Concurrent requests read the same stale `used` and all passed the monthly check. With the lock restored: exactly 20 accepted, `used == 100`, invariants I5/I6 hold. This is the race the design exists to prevent (§6.3), and it shows the test detects it.
+
 ---
 
 ## 12. Observability
@@ -583,7 +637,7 @@ Results table per iteration: RPS, p50/p95/p99, error rate, invariant check ✅/�
 | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
 | Unit                        | Rules engine: every brief example (25 → user per-request; 10 → accepted; account has 5 left → account monthly), order of violations, `remaining` clamps at 0, missing rule = unlimited                                                                                                                                                              | Vitest, pure functions                 |
 | Integration (real Postgres) | Every endpoint happy path + errors; **auth:** missing/invalid/revoked key; **isolation:** A cannot see/consume/assign B's users and plans; plan update affects all assigned users; plan switch preserves usage; allowance lowered below usage → remaining 0 + rejections; month boundary (by inserting a past-month counter/ledger and querying it) | Vitest + supertest                     |
-| Concurrency                 | 200 parallel consumes vs allowance → exact accept count; account = Σ users; 50 parallel identical `requestId` → 1 row, 1 increment; payload mismatch → 409                                                                                                                                                                                          | Vitest + `Promise.all` against real DB |
+| Concurrency                 | 200 parallel consumes vs allowance → exact accept count; account = Σ users; 50 parallel identical `requestId` → 1 row, 1 increment; payload mismatch → 409; 40 consumes while the user's plan flips `maxUnitsPerRequest` 10 ↔ 30 → every accepted row within the limits of the plan version it records; 5 accounts × 20 in parallel → exact per-account totals, no cross-account rows. Run 20× in a row before merging. | Vitest + `Promise.all` against real DB |
 | Load                        | §11                                                                                                                                                                                                                                                                                                                                                 | k6                                     |
 | Demo smoke                  | Demo scenario runs end-to-end in compose                                                                                                                                                                                                                                                                                                            | script                                 |
 
