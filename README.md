@@ -2,7 +2,7 @@
 
 An HTTP service that decides, before an application processes a unit of work, whether an account and one of its users still have quota for it. Each account and each user has a plan (a monthly allowance and a per-request limit). A consume call is accepted only if both levels pass, and every decision goes into a ledger. It is built with TypeScript, Express 5 and PostgreSQL 16, and correctness under concurrency is enforced by the database. See [DESIGN.md](DESIGN.md) for the full design. It is the source of truth for this project.
 
-> Status: Phase 4. Accounts, API keys, plans, users, effective limits, `POST /v1/consume`, monthly usage and decision history exist. The demo app comes next. See [DESIGN.md §18](DESIGN.md#18-build-order).
+> Status: Phase 5. Accounts, API keys, plans, users, effective limits, `POST /v1/consume`, monthly usage, decision history and the demo app exist. Load testing comes next. See [DESIGN.md §18](DESIGN.md#18-build-order).
 
 ## Run it
 
@@ -13,7 +13,7 @@ docker compose up --build
 curl localhost:3000/health/ready   # {"status":"ok"}
 ```
 
-The API listens on `localhost:3000`. On startup it applies database migrations and seeds the predefined plans. Both steps are safe to repeat on every start. Optional settings (`ADMIN_API_KEY`, `LOG_LEVEL`, `DB_POOL_MAX`) can go in a `.env` file; see [.env.example](.env.example).
+This starts three services: `db`, `api` and `demo`. Open the demo at **http://localhost:8080** (see [Demo](#demo)). The API listens on `localhost:3000`. On startup it applies database migrations and seeds the predefined plans. Both steps are safe to repeat on every start. Optional settings (`ADMIN_API_KEY`, `LOG_LEVEL`, `DB_POOL_MAX`) can go in a `.env` file; see [.env.example](.env.example).
 
 | Endpoint                     | Auth          | Meaning                                                        |
 | ---------------------------- | ------------- | -------------------------------------------------------------- |
@@ -130,6 +130,70 @@ Predefined plan ids (fixed, from [`api/src/db/seed.ts`](api/src/db/seed.ts)):
 | Premium | user    | `00000000-0000-4000-8000-00000000b002` | 5,000   | 100           |
 
 Errors are `application/problem+json` with a stable `code` and the `requestId`. The full list of codes is in [DESIGN.md §8.1](DESIGN.md#81-error-codes).
+
+## Demo
+
+Open **http://localhost:8080** after `docker compose up --build`. The demo plays **DocuCorp**, a client application that asks the metering API before it processes each document.
+
+**Where the keys are.** The page talks only to the demo server (`demo-app/`). The demo server holds DocuCorp's API key and calls the metering API, so no API key ever reaches the browser. The request JSON shown on the page names the key header but never contains the key. The demo server also holds `ADMIN_API_KEY`, because it plays the operator who creates accounts. **A real client app would only have its own account's API key.**
+
+On startup the demo server waits for `/health/ready`, then sets up DocuCorp. This is safe to repeat on every start:
+
+- It creates the DocuCorp account once with the admin key. The API shows an account's key only once, so the demo keeps it in `/data/docucorp.json` on the `demo-data` volume, and restarts reuse it.
+- It creates the custom account plan **Demo Team** (monthly 60, max 50 per request), assigns it, and registers **alice (Basic)**, **bob (Premium)** and **carol (Basic)**. A `409` means "already exists": the demo looks the object up and leaves it unchanged, so a restart keeps your free-play usage and configuration changes.
+
+What the page shows, top to bottom:
+
+| Part                | What it shows                                                                                                                                    |
+| ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Guided scenario     | The brief's story, step by step, with the decision and a pass/fail mark against the expected outcome for each step (below).                      |
+| Shared account      | DocuCorp's plan and this month's used/remaining. This is the one place for account usage; every user draws from it.                            |
+| User cards          | Each user's plan and per-request max, one bar for the user's own allowance, a units input and **Process document** (a new `requestId` every time). After a request: a large **ACCEPTED** / **REJECTED** with the units; for a rejection a **USER LIMIT** or **ACCOUNT LIMIT** badge and one plain sentence; then "remaining: user X · account Y" and the raw JSON. **Retry last request** (shown after the first request) sends the same `requestId` again and gets the stored decision with `replayed: true`. |
+| Configuration       | Change a user's plan (`PUT /v1/users/:id/plan`) or Demo Team's limits (`PATCH /v1/plans/:id`). These are API calls with data. The code that processes documents doesn't change. |
+| Recent requests     | The last 10 decisions from `GET /v1/requests`.                                                                                                   |
+| How this demo works | Collapsed: where the keys are, what the scenario runs on, how to reset.                                                                          |
+
+API errors (4xx/5xx) show as a banner with the status, the `code`, the message and whether the demo server or the metering API refused.
+
+### Guided scenario
+
+**Run guided scenario** creates a **fresh** account each time, with its own Demo Team plan and users, so the result is the same whatever you did in free play. DocuCorp is not touched.
+
+| Step | Action                                                         | Expected outcome                                         | Brief requirement it shows                                       |
+| ---- | -------------------------------------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------- |
+| 1    | alice (Basic) processes 10                                     | accepted                                                 | A request within every limit is accepted                         |
+| 2    | alice processes 25                                             | rejected: **user** `max_units_per_request` (Basic = 20)  | Per-request limit on the user's plan                             |
+| 3    | bob (Premium) processes 45                                     | accepted; the account has 5 left                         | A bigger user plan; usage counts against the shared account      |
+| 4    | carol (Basic) processes 10                                     | rejected: **account** `monthly_allowance`                | The account limit binds even when the user has plenty left       |
+| 5    | `PATCH` Demo Team monthly → 200; `PUT` alice → Premium         | both 200                                                 | Limits change by configuration, with no code change or redeploy  |
+| 6    | carol processes 10; alice processes 25                         | both accepted                                            | Changes apply to the next request; usage is kept across the plan switch |
+
+Every step shows a one-line explanation, the decision (ACCEPTED / REJECTED, with the USER LIMIT / ACCOUNT LIMIT badge and a plain sentence for rejections), remaining for user and account, the expected outcome with a ✓ / ✗ mark, and the raw request/response JSON (collapsed).
+
+Each scenario run leaves one small account (`Scenario <timestamp>`) in the database. There is no account deletion ([DESIGN.md §16](DESIGN.md#16-product-assumptions-to-copy-into-the-readme)), so this is expected.
+
+### Reset
+
+```sh
+docker compose down -v   # removes the database and the demo-data volume, so DocuCorp starts fresh
+docker compose up --build
+```
+
+Restarting without `-v` keeps DocuCorp, its usage and any configuration changes. If only the database volume is removed, the stored key no longer works: the demo logs a warning and creates a new DocuCorp.
+
+### Smoke test
+
+With the stack running:
+
+```sh
+cd demo-app
+npm ci
+npm run smoke   # DEMO_URL defaults to http://localhost:8080
+```
+
+It runs the guided scenario and checks all six outcomes from the raw API responses (not just the demo's own pass marks), processes and retries one document on DocuCorp to check for `replayed: true`, checks that an API error reaches the page as such, and checks that no response the page receives contains an `mk_` key. The smoke document asks for 1,000 units, more than any per-request limit allows, so it is rejected and uses no quota. CI runs the same check on a fresh `docker compose up --build --wait`.
+
+To run the demo server outside Docker: `cd demo-app && ADMIN_API_KEY=… DATA_DIR=.data npm run dev` (it calls `METERING_API_URL`, default `http://localhost:3000`).
 
 ## Run the tests
 
