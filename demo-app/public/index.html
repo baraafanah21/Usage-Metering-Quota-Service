@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <title>DocuCorp · metering demo</title>
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="wrap">
+      <h1>DocuCorp</h1>
+      <p class="tagline">Before each document, the user's plan and the shared account must both allow it.</p>
+    </header>
+
+    <div id="errors" class="wrap" aria-live="polite"></div>
+
+    <main class="wrap">
+      <section aria-labelledby="scenario-h">
+        <div class="section-head">
+          <h2 id="scenario-h">Guided scenario</h2>
+          <button id="run-scenario" type="button" class="primary">Run guided scenario</button>
+        </div>
+        <p class="hint">The brief's six steps, on a fresh account each run.</p>
+        <div id="scenario"></div>
+      </section>
+
+      <section aria-labelledby="free-h">
+        <h2 id="free-h">Free play</h2>
+        <div id="account" class="account">Loading…</div>
+        <div id="users" class="cards"></div>
+
+        <h3 class="sub">Configuration</h3>
+        <p class="hint">API calls with data. The code that processes documents doesn't change.</p>
+        <div class="config">
+          <form id="user-plan-form">
+            <label>User <select name="user" id="cfg-user"></select></label>
+            <label>Plan <select name="planId" id="cfg-plan"></select></label>
+            <button type="submit">Assign plan</button>
+          </form>
+          <form id="plan-limits-form">
+            <label><span><span id="cfg-demo-team">Demo Team</span> monthly allowance</span>
+              <input name="monthlyAllowance" type="number" min="0" step="1" inputmode="numeric" placeholder="unlimited" />
+            </label>
+            <label>Max units per request
+              <input name="maxUnitsPerRequest" type="number" min="0" step="1" inputmode="numeric" placeholder="unlimited" />
+            </label>
+            <button type="submit">Update plan</button>
+          </form>
+        </div>
+        <div id="config-result"></div>
+
+        <h3 class="sub">Recent requests</h3>
+        <div class="table-scroll">
+          <table id="history">
+            <thead>
+              <tr><th>Time (UTC)</th><th>User</th><th>Units</th><th>Decision</th><th>Reason</th><th>requestId</th></tr>
+            </thead>
+            <tbody></tbody>
+          </table>
+        </div>
+      </section>
+
+      <details class="about">
+        <summary>How this demo works</summary>
+        <ul>
+          <li>
+            This page talks only to the demo server. The demo server holds DocuCorp's API key and calls the
+            metering API, so no API key reaches the browser. The request JSON shown here names the key header,
+            never the key.
+          </li>
+          <li>
+            The demo server also holds the operator (admin) key, because it plays the operator who creates
+            accounts. A real client app would only have its own account's API key.
+          </li>
+          <li>
+            Free play uses DocuCorp (Demo Team: 60 a month, max 50 per request; alice and carol on Basic, bob on
+            Premium). The guided scenario creates a fresh account each run, so its result doesn't depend on free play.
+          </li>
+          <li>"Retry" sends the same <code>requestId</code> again: you get the stored decision, nothing is counted twice.</li>
+          <li>Reset everything with <code>docker compose down -v</code>.</li>
+        </ul>
+      </details>
+    </main>
+
+    <script src="app.js" type="module"></script>
+  </body>
+</html>

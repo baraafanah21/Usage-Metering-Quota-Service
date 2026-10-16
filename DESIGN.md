@@ -639,7 +639,7 @@ Recorded in Phase 3b as a mutation check on the concurrency test "allowance 100,
 | Integration (real Postgres) | Every endpoint happy path + errors; **auth:** missing/invalid/revoked key; **isolation:** A cannot see/consume/assign B's users and plans; plan update affects all assigned users; plan switch preserves usage; allowance lowered below usage → remaining 0 + rejections; month boundary (by inserting a past-month counter/ledger and querying it) | Vitest + supertest                     |
 | Concurrency                 | 200 parallel consumes vs allowance → exact accept count; account = Σ users; 50 parallel identical `requestId` → 1 row, 1 increment; payload mismatch → 409; 40 consumes while the user's plan flips `maxUnitsPerRequest` 10 ↔ 30 → every accepted row within the limits of the plan version it records; 5 accounts × 20 in parallel → exact per-account totals, no cross-account rows. Run 20× in a row before merging. | Vitest + `Promise.all` against real DB |
 | Load                        | §11                                                                                                                                                                                                                                                                                                                                                 | k6                                     |
-| Demo smoke                  | Demo scenario runs end-to-end in compose                                                                                                                                                                                                                                                                                                            | script                                 |
+| Demo smoke                  | Guided scenario end-to-end in compose: all six outcomes, retry → `replayed: true`, no `mk_` key in any response to the browser (§14)                                                                                                                                                                                                              | `demo-app/scripts/smoke.ts`, CI job `demo` |
 
 Each test file uses a fresh account (new UUIDs), so tests can run in parallel without truncating tables.
 
@@ -647,18 +647,23 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 
 ## 14. Demo Application
 
-`demo-app` (small Node server + one HTML page, port 8080):
+`demo-app` (TypeScript + Express server, one static page with plain CSS and vanilla JS, no build step for the page; port 8080):
 
-- On startup: waits for the API, then **idempotently** creates the "DocuCorp" account via the admin key and stores its API key in a volume, creates a custom account plan _Demo Team_ (monthly 60, max/request 50) and three users: **alice (Basic)**, **bob (Premium)**, **carol (Basic)**.
-- UI: one card per user — plan, used/remaining for user **and** shared account, "Process document (N units)" button, last decision with the reason highlighted (user vs account).
-- **Guided scenario button** that walks through the brief's required story, step by step:
+- **Keys stay on the server.** The browser talks only to the demo server (`/api/*`). The demo server holds the account's API key and calls the metering API (`METERING_API_URL`). The request JSON it shows names the key header with a placeholder, never the key. As a safety net, any `/api` JSON response matching `mk_[A-Za-z0-9]{8,}` is withheld (500 `KEY_LEAK_BLOCKED`, logged). The demo also holds `ADMIN_API_KEY`, because it plays the operator who creates accounts. A real client app would have only its own API key. The page and README say so.
+- **Bootstrap, idempotent, on every start:** waits for `/health/ready` (backoff 0.5 s doubling to 5 s). Then it creates "DocuCorp" with the admin key once and stores its API key in `/data/docucorp.json` on the `demo-data` named volume (write-then-rename, mode 600). Then it creates the custom account plan _Demo Team_ (monthly 60, max/request 50), assigns it if it isn't already, and registers **alice (Basic)**, **bob (Premium)**, **carol (Basic)**. `409 PLAN_NAME_TAKEN` / `USER_ALREADY_EXISTS` mean "already exists": the plan is looked up by name and existing objects are left unchanged, so a restart keeps free-play usage and configuration. If the stored key gets `401 INVALID_API_KEY` (database reset, demo volume kept), a new DocuCorp is created and the file replaced. Transient failures (unreachable, 5xx) are retried; any other 4xx is a configuration error and exits. `/health/ready` on the demo is 200 only after bootstrap, and compose uses it as the demo's healthcheck.
+- **One client code path.** `checkQuotaBeforeProcessing()` (`src/documents.ts`) is the only consume call. Free play and the scenario both use it. Configuration changes are separate API calls with data.
+- **Demo server endpoints (for the page):** `GET /api/state` (account plan + used/remaining, each user's `GET /v1/users/:id/limits`, the last 10 of `GET /v1/requests`, user plans, Demo Team's rules); `POST /api/process {user, units}` (new `requestId` = UUID, returns `{request, response}`); `POST /api/retry {requestId, user, units}` (same id again → `replayed: true`); `POST /api/config/plan-limits` (`PATCH` Demo Team) and `POST /api/config/user-plan` (`PUT` a user's plan); `POST /api/scenario`. An API error keeps its status and comes back as `{error: {code, title, detail, errors, source: "metering-api"}, request, response}`. The demo's own errors have `source: "demo"`.
+- **UI, in this order:** the guided scenario; then free play: the shared-account card (the one place for account usage), one card per user (name, plan with its per-request max, one bar for the user's own allowance, units input, "Process document"; after the first request, the decision and "Retry last request"), a config panel (change a user's plan, change Demo Team's limits) and a recent-requests table; last, a collapsed "How this demo works" with the key explanation. **The decision is the most visible thing:** a large ACCEPTED / REJECTED with the units, for rejections a USER LIMIT / ACCOUNT LIMIT badge and one plain sentence (e.g. "carol has 1,000 left, but the shared account has only 5"), then "remaining: user X · account Y". Neutral light background (dark via `prefers-color-scheme`), one accent color for actions, green/red only for accepted/rejected. API errors are a visible banner with status, code and source. Works at phone width.
+- **Guided scenario button.** It runs on a **fresh account** each time (created with the admin key, with its own Demo Team plan and users), so free play can't change its result:
   1. alice processes 10 → ✅ accepted
   2. alice processes 25 → ❌ rejected by **user** `max_units_per_request` (Basic = 20)
   3. bob (Premium) processes 45 → ✅ ; account now has 5 left
   4. carol processes 10 → ❌ rejected by **account** `monthly_allowance` (carol herself has plenty)
   5. **Change configuration only** (no client code change): `PATCH` the account plan to monthly 200, and `PUT` alice → Premium
   6. carol 10 → ✅ ; alice 25 → ✅ — same client code, different outcome.
-- Each step shows the raw request/response JSON, so the reviewer sees the API, not just a pretty UI.
+- Each step shows a one-line explanation, the decision in the same form as free play (verdict, badge, sentence, remaining), the expected outcome with a pass/fail mark, and the raw request/response JSON (collapsible), so the reviewer sees the API, not just a pretty UI. Each run leaves one `Scenario <timestamp>` account behind (accounts are not deleted, §16).
+- **Smoke test:** `demo-app/scripts/smoke.ts` (`npm run smoke`) runs `/api/scenario` against a running stack. It checks all six outcomes from the raw API responses, a process + retry (`replayed: true`), an API error passed through (404), and that no response the page receives contains `mk_`. CI job `demo`: `docker compose up --build -d --wait`, then the smoke test.
+- **Compose:** `api` has a healthcheck (`node -e` + `fetch` on `/health/ready`; the image has no curl). `demo` depends on `api: service_healthy` and gets the same `ADMIN_API_KEY` through one YAML anchor.
 
 ---
 
@@ -679,7 +684,11 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 │   │   ├── repositories/{plans.ts, users.ts, usage.ts, requests.ts, accounts.ts, apiKeys.ts}
 │   │   └── db/{pool.ts, tx.ts, migrate.ts, seed.ts, migrations/001_init.sql}
 │   └── test/{unit, integration, concurrency}
-├── demo-app/{Dockerfile, server.ts, public/index.html}
+├── demo-app/
+│   ├── Dockerfile
+│   ├── src/{server.ts, bootstrap.ts, provision.ts, scenario.ts, documents.ts, metering.ts, config.ts}
+│   ├── public/{index.html, style.css, app.js}
+│   └── scripts/smoke.ts
 ├── load/{scenarios/*.js, verify.sql, run.sh, results/}
 └── docs/{performance.md, api-examples.http}
 ```
