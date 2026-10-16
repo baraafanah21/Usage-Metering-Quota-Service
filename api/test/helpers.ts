@@ -108,6 +108,69 @@ export async function createMeteredAccount(
   return { ...account, accountPlanId: accountPlan.id, userPlanId: userPlan.id };
 }
 
+/**
+ * Writes ledger rows for LAST month straight into the database (the API only ever writes the
+ * current month), dated the 2nd of that month, against each user's and the account's current
+ * plan. Then sets both counters to the accepted totals, so invariant I5 holds for that month
+ * too. Returns the month as "YYYY-MM".
+ */
+export async function seedLastMonth(
+  pool: Pool,
+  accountId: string,
+  rows: { externalId: string; units: number; decision: "accepted" | "rejected"; requestId: string }[],
+): Promise<string> {
+  const month = "(date_trunc('month', now() AT TIME ZONE 'UTC') - interval '1 month')::date";
+  for (const row of rows) {
+    const rejected = row.decision === "rejected";
+    const { rowCount } = await pool.query(
+      `INSERT INTO usage_requests
+         (account_id, user_id, request_id, units, decision, reject_scope, reject_rule, month,
+          account_plan_id, account_plan_version, user_plan_id, user_plan_version, evaluation, created_at)
+       SELECT $1, u.id, $3, $4, $5, $6, $7, ${month},
+              ap.id, ap.version, up.id, up.version, '{"seeded": true}', ${month} + interval '1 day'
+       FROM users u
+       JOIN accounts a ON a.id = u.account_id
+       JOIN plans ap ON ap.id = a.plan_id
+       JOIN plans up ON up.id = u.plan_id
+       WHERE u.account_id = $1 AND u.external_id = $2`,
+      [
+        accountId,
+        row.externalId,
+        row.requestId,
+        row.units,
+        row.decision,
+        rejected ? "user" : null,
+        rejected ? "monthly_allowance" : null,
+      ],
+    );
+    expect(rowCount, `seed ${row.requestId}`).toBe(1);
+  }
+  await pool.query(
+    `INSERT INTO account_monthly_usage (account_id, month, used)
+     SELECT account_id, month, sum(units) FROM usage_requests
+     WHERE account_id = $1 AND month = ${month} AND decision = 'accepted' GROUP BY account_id, month
+     ON CONFLICT (account_id, month) DO UPDATE SET used = EXCLUDED.used`,
+    [accountId],
+  );
+  await pool.query(
+    `INSERT INTO user_monthly_usage (user_id, account_id, month, used)
+     SELECT user_id, account_id, month, sum(units) FROM usage_requests
+     WHERE account_id = $1 AND month = ${month} AND decision = 'accepted' GROUP BY user_id, account_id, month
+     ON CONFLICT (user_id, month) DO UPDATE SET used = EXCLUDED.used`,
+    [accountId],
+  );
+  const { rows: m } = await pool.query<{ month: string }>(`SELECT to_char(${month}, 'YYYY-MM') AS month`);
+  return m[0]!.month;
+}
+
+/** The current UTC month as "YYYY-MM", by the database clock (the one the API uses). */
+export async function currentMonth(pool: Pool): Promise<string> {
+  const { rows } = await pool.query<{ month: string }>(
+    "SELECT to_char(date_trunc('month', now() AT TIME ZONE 'UTC'), 'YYYY-MM') AS month",
+  );
+  return rows[0]!.month;
+}
+
 /** POST /v1/consume as the given account. */
 export function consumeAs(app: Express, apiKey: string, body: { userId: string; units: number; requestId?: string }) {
   return request(app)

@@ -205,7 +205,7 @@ function replayOf(stored: StoredRequest, input: ConsumeInput): ConsumeResponse {
 
 // jsonb stores object keys in its own order (by length, then bytes), not insertion order.
 // Rebuild the stored body field by field so a replay reads exactly like the original.
-function inContractOrder(r: ConsumeResponse): ConsumeResponse {
+export function inContractOrder(r: ConsumeResponse): ConsumeResponse {
   const violation = (v: Violation): Violation => ({
     scope: v.scope,
     rule: v.rule,

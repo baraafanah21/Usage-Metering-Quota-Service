@@ -9,6 +9,8 @@ import { adminRouter } from "./http/routes/admin.js";
 import { consumeRouter } from "./http/routes/consume.js";
 import { healthRouter } from "./http/routes/health.js";
 import { plansRouter } from "./http/routes/plans.js";
+import { requestsRouter } from "./http/routes/requests.js";
+import { usageRouter } from "./http/routes/usage.js";
 import { usersRouter } from "./http/routes/users.js";
 
 export interface AppDeps {
@@ -37,6 +39,8 @@ export function createApp({ pool, logger, adminApiKey }: AppDeps): Express {
   v1.use("/plans", plansRouter(pool));
   v1.use("/users", usersRouter(pool));
   v1.use("/consume", consumeRouter(pool));
+  v1.use("/usage", usageRouter(pool));
+  v1.use("/requests", requestsRouter(pool));
   app.use("/v1", v1);
 
   app.use(notFoundHandler);

@@ -14,6 +14,14 @@ export async function withTransaction<T>(
 ): Promise<T> {
   const client = await pool.connect();
   let broken: Error | undefined;
+  // pg-pool removes its own 'error' listener while a client is checked out. If the server ends
+  // the session mid-transaction (restart, pg_terminate_backend), pg rejects the running query
+  // AND emits 'error'; with no listener that emit is an uncaught exception that kills the
+  // process. The rejected query already reports the failure, so only mark the client broken.
+  const onError = (err: Error) => {
+    broken = err;
+  };
+  client.on("error", onError);
   try {
     await client.query("BEGIN");
     const result = await fn(client);
@@ -27,6 +35,7 @@ export async function withTransaction<T>(
     }
     throw err;
   } finally {
+    client.removeListener("error", onError);
     client.release(broken);
   }
 }

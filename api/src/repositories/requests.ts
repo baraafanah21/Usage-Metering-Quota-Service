@@ -28,6 +28,135 @@ export interface NewLedgerRow {
   response: unknown;
 }
 
+export interface LedgerEntry {
+  /** The ledger's identity column, as text (bigint). Pagination position, never shown. */
+  id: string;
+  requestId: string;
+  externalId: string;
+  units: number;
+  decision: Decision;
+  rejectScope: Scope | null;
+  rejectRule: RuleType | null;
+  /** "YYYY-MM" */
+  month: string;
+  createdAt: Date;
+  accountPlanId: string;
+  accountPlanVersion: number;
+  userPlanId: string;
+  userPlanVersion: number;
+  /** The stored response snapshot; only loaded when asked for. */
+  evaluation?: unknown;
+}
+
+export interface HistoryFilters {
+  /** Internal user id (already resolved from the externalId and scoped to the account). */
+  userId?: string | undefined;
+  /** 'YYYY-MM-DD', first of the month. */
+  month?: string | undefined;
+  decision?: Decision | undefined;
+}
+
+/**
+ * One page of the account's ledger, newest first: WHERE id < $cursor ORDER BY id DESC
+ * LIMIT limit + 1. Only the filters given become predicates, and each combination is read in
+ * order from one §4 index: usage_requests_user_hist (userId, with or without other filters),
+ * usage_requests_account_month (month), usage_requests_account_hist (none, or decision).
+ *
+ * That index's columns before id are matched as one-value ranges and kept in the sort key,
+ * e.g. ORDER BY account_id, month, id DESC. With a plain `= $1`, Postgres treats a column as
+ * a constant, so other orderings also yield "id DESC" (a backward scan of the primary key, or
+ * of account_hist when a month is given), and it may pick one that filters its way through
+ * every newer row of everyone else (30,000 rows read for one page in the PR's EXPLAIN). With
+ * the ranges, only the intended index can produce the order. Same rows, same order.
+ */
+export async function listRequests(
+  accountId: string,
+  page: { filters: HistoryFilters; limit: number; before: string | undefined; withEvaluation: boolean },
+  db: Queryable,
+): Promise<{ requests: LedgerEntry[]; next: string | null }> {
+  const { userId, month, decision } = page.filters;
+  const values: unknown[] = [accountId];
+  const where: string[] = [];
+  const add = (predicate: (param: string) => string, value: unknown) => {
+    values.push(value);
+    where.push(predicate(`$${values.length}`));
+  };
+  const onlyValue = (column: string, type: string) => (p: string) =>
+    `${column} >= ${p}::${type} AND ${column} <= ${p}::${type}`;
+  const sortKey: string[] = [];
+  if (userId !== undefined) {
+    // usage_requests_user_hist (user_id, id DESC); the account check stays as a plain filter.
+    where.push("r.account_id = $1");
+    add(onlyValue("r.user_id", "uuid"), userId);
+    sortKey.push("r.user_id");
+    if (month !== undefined) add((p) => `r.month = ${p}::date`, month);
+  } else {
+    // usage_requests_account_month (account_id, month, id DESC) or account_hist (account_id, id DESC).
+    where.push(onlyValue("r.account_id", "uuid")("$1"));
+    sortKey.push("r.account_id");
+    if (month !== undefined) {
+      add(onlyValue("r.month", "date"), month);
+      sortKey.push("r.month");
+    }
+  }
+  if (decision !== undefined) add((p) => `r.decision = ${p}::decision`, decision);
+  if (page.before !== undefined) add((p) => `r.id < ${p}::bigint`, page.before);
+  values.push(page.limit + 1);
+
+  const { rows } = await db.query<{
+    id: string;
+    request_id: string;
+    external_id: string;
+    units: string;
+    decision: Decision;
+    reject_scope: Scope | null;
+    reject_rule: RuleType | null;
+    month: string;
+    created_at: Date;
+    account_plan_id: string;
+    account_plan_version: number;
+    user_plan_id: string;
+    user_plan_version: number;
+    evaluation: unknown;
+  }>(
+    // externalId is looked up for the returned rows only (users_pkey), not joined: a join lets
+    // the planner start from users and probe the ledger once per user of the whole table. The
+    // composite FK (user_id, account_id) already guarantees the user is this account's.
+    `SELECT r.id::text AS id, r.request_id,
+            (SELECT u.external_id FROM users u WHERE u.id = r.user_id) AS external_id,
+            r.units, r.decision, r.reject_scope, r.reject_rule, to_char(r.month, 'YYYY-MM') AS month,
+            r.created_at, r.account_plan_id, r.account_plan_version, r.user_plan_id, r.user_plan_version,
+            ${page.withEvaluation ? "r.evaluation" : "NULL::jsonb AS evaluation"}
+     FROM usage_requests r
+     WHERE ${where.join(" AND ")}
+     ORDER BY ${sortKey.join(", ")}, r.id DESC
+     LIMIT $${values.length}`,
+    values,
+  );
+
+  const hasMore = rows.length > page.limit;
+  const pageRows = hasMore ? rows.slice(0, page.limit) : rows;
+  return {
+    requests: pageRows.map((r) => ({
+      id: r.id,
+      requestId: r.request_id,
+      externalId: r.external_id,
+      units: Number(r.units),
+      decision: r.decision,
+      rejectScope: r.reject_scope,
+      rejectRule: r.reject_rule,
+      month: r.month,
+      createdAt: r.created_at,
+      accountPlanId: r.account_plan_id,
+      accountPlanVersion: r.account_plan_version,
+      userPlanId: r.user_plan_id,
+      userPlanVersion: r.user_plan_version,
+      ...(page.withEvaluation && { evaluation: r.evaluation }),
+    })),
+    next: hasMore ? pageRows.at(-1)!.id : null,
+  };
+}
+
 /** The decision already recorded for this requestId in this account, if any. */
 export async function findRequest(
   accountId: string,

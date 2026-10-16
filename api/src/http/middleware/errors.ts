@@ -1,4 +1,5 @@
 import type { ErrorRequestHandler, Request, RequestHandler, Response } from "express";
+import { isConnectionError } from "../../db/errors.js";
 import { AppError, type FieldError } from "../../domain/errors.js";
 
 interface Problem {
@@ -44,13 +45,27 @@ function fromBodyParser(err: unknown): AppError | undefined {
   }
 }
 
+// The database is unreachable or dropped the connection (§10). Any open transaction was
+// rolled back by Postgres; if the connection broke during COMMIT the outcome is unknown, and
+// idempotency by requestId is what makes a retry safe either way.
+function fromDatabaseOutage(err: unknown): AppError | undefined {
+  if (!isConnectionError(err)) return undefined;
+  return new AppError(
+    503,
+    "SERVICE_UNAVAILABLE",
+    "Database unavailable",
+    "The database could not be reached; retry the same request later",
+    { cause: err },
+  );
+}
+
 export const errorHandler: ErrorRequestHandler = (err, req, res, next) => {
   if (res.headersSent) {
     next(err);
     return;
   }
 
-  const known = err instanceof AppError ? err : fromBodyParser(err);
+  const known = err instanceof AppError ? err : (fromBodyParser(err) ?? fromDatabaseOutage(err));
   if (known) {
     if (known.status >= 500) req.log.error({ err }, known.title);
     sendProblem(req, res, known);
