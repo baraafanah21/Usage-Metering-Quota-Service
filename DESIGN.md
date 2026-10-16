@@ -589,20 +589,24 @@ The **account counter row**. All consumes for one account serialize on it, so pe
 
 ### 11.2 Scenarios (k6, committed in `load/`)
 
-| Scenario      | Shape                                                 | What it proves                                                  |
-| ------------- | ----------------------------------------------------- | --------------------------------------------------------------- |
-| `spread`      | 200 accounts × 5 users, random consumes               | Baseline throughput with no contention                          |
-| `hot-account` | 1 account, 500 users, 100 VUs                         | Contention on the shared row; latency vs concurrency            |
-| `hot-user`    | 1 user, 100 VUs                                       | Worst case (both rows hot)                                      |
-| `exhaust`     | Allowance 10,000, 20,000 units requested concurrently | **Correctness under load:** exactly 10,000 accepted, never more |
-| `retry-storm` | Same `requestId` sent ×N concurrently                 | Exactly one increment                                           |
-| `plan-flip`   | Consumes while another VU toggles the user plan       | No errors, every ledger row consistent with its plan version    |
+| Scenario      | Shape                                                                         | What it proves                                                  |
+| ------------- | ----------------------------------------------------------------------------- | --------------------------------------------------------------- |
+| `spread`      | 200 accounts × 5 users, 1–10 units, 100 VUs, 60 s                             | Baseline throughput with no contention                          |
+| `hot-account` | 1 account, 500 users, 1–10 units, 100 VUs, 60 s                               | Contention on the shared row; latency vs concurrency            |
+| `hot-user`    | 1 user, 1–10 units, 100 VUs, 60 s                                             | Worst case (both rows hot)                                      |
+| `exhaust`     | Allowance 10,000; 2,000 × 10 units (20,000) over 100 VUs, 50 users            | **Correctness under load:** exactly 10,000 accepted, never more |
+| `retry-storm` | 100 fixed requests resent by 100 VUs for 30 s                                 | Exactly one ledger row and one increment per `requestId`        |
+| `plan-flip`   | 50 VUs consume 1–30 units; 1 VU flips the user plan's max 10 ↔ 30 every ~100 ms | No errors, every ledger row consistent with its plan version    |
 
-After every run a **verification script** (`load/verify.sql`) checks invariants I5 and I6 over the whole database and fails loudly if they don't hold. Performance numbers without this check don't count.
+The scenarios (`load/scenarios/*.js`) are closed-loop (each VU sends its next request as soon as the last one answers), so they measure saturation throughput, and latency includes queueing. Every request has a unique `requestId` except in `retry-storm`. The k6 error rate counts every non-200 (a rejection is a 200, §6.1).
+
+`load/run.sh <scenario> <label>` runs one scenario end to end: `load/setup.ts` creates fresh accounts through the public API (admin key, then the account keys it gets back) and writes keys and ids to `load/.work/` (gitignored); k6 (compose profile `loadtest`, pinned image) runs against `api` by service name; its summary goes to `load/results/<label>/<scenario>.json`. During the run, `/metrics` is sampled every 0.5 s for the pool gauges and diffed before/after for the consume histograms, and `pg_stat_statements` (preloaded on the compose `db`) records the top statements. `load/run-all.sh <label> [runs]` runs every scenario N times, each on a fresh stack, and writes the medians. How to run it and the numbers: `docs/performance.md`.
+
+After every run a **verification script** (`load/verify.sql`) checks over the whole database, every month, and fails loudly (`RAISE`, non-zero exit) if any of these break: I5 and I6; no counter above its plan's monthly allowance where every accepted row that month was evaluated against the plan version assigned now; every accepted ledger row within the limits of its own evaluation snapshot, which names the plan versions the row records. For `exhaust` and `retry-storm` it also checks the scenario account's exact accepted units and ledger rows. Performance numbers without this check don't count.
 
 ### 11.3 Iterations (measure → change one thing → re-measure → record in `docs/performance.md`)
 
-1. **Baseline:** straightforward multi-statement transaction (~6 round trips).
+1. **Baseline:** straightforward multi-statement transaction. Measured in Phase 3b: 10 round trips per consume (the API-key lookup, then `BEGIN`, timeouts, idempotency lookup, user + plans, account lock, user lock, two increments, ledger insert, `COMMIT`); 5 of them while holding the account row lock. Numbers: `docs/performance.md`.
 2. **API-key cache:** in-process LRU (30s TTL) → removes 1 query per request.
 3. **Fewer round trips:** user + both plans' rules in one query; counter upsert+lock merged (`INSERT … ON CONFLICT DO UPDATE … RETURNING`).
 4. **Stateless pre-check before locks** (already in design; measure the gain on the oversized-request mix).
@@ -625,7 +629,12 @@ Recorded in Phase 3b as a mutation check on the concurrency test "allowance 100,
 ## 12. Observability
 
 - **Logs (pino, JSON):** one line per request: `reqId`, `accountId`, route, status, latency. Consume adds `decision`, `rejectScope`, `rejectRule`, `replayed`. API keys are redacted.
-- **Metrics:** `http_request_duration_seconds{route,status}`, `consume_decisions_total{decision,scope,rule}`, `consume_replays_total`, `consume_idempotency_conflicts_total`, `db_pool_waiting`, `db_tx_duration_seconds`.
+- **Metrics** (`GET /metrics`, prom-client, no auth like `/health`; one registry per process, `src/metrics.ts`):
+  - `http_request_duration_seconds{route,method,status}`: `route` is the pattern (`/v1/users/:externalId/limits`), never the raw path, so user ids don't create series. Requests that match no route (unknown paths, 401 from the `/v1` key guard) are `route="unmatched"`.
+  - `consume_decisions_total{decision,scope,rule}`: new decisions only; `scope`/`rule` are `none` when accepted. `consume_replays_total`, `consume_idempotency_conflicts_total`.
+  - `consume_tx_duration_seconds`: `BEGIN` to `COMMIT`/`ROLLBACK` on a connection already acquired, so it includes row-lock waits but not pool queueing. `consume_pool_acquire_seconds`: the wait for a pool connection before `BEGIN`. Separating the two is what lets the load tests say where time goes (§11).
+  - `db_pool_total`, `db_pool_idle`, `db_pool_waiting`: read from the pool when `/metrics` is scraped.
+  - Default Node process metrics (CPU, memory, event-loop lag, GC).
 - **Health:** `/health/live` (process up), `/health/ready` (`SELECT 1` succeeds + migrations applied).
 - Every response carries `X-Request-Id` (incoming or generated) for tracing a request through logs — useful in the live debugging part of the review.
 
@@ -677,7 +686,7 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 ├── api/
 │   ├── Dockerfile
 │   ├── src/
-│   │   ├── server.ts / app.ts / config.ts
+│   │   ├── server.ts / app.ts / config.ts / metrics.ts
 │   │   ├── http/{middleware/{auth.ts, validate.ts, errors.ts}, routes/*.ts, schemas/*.ts, views.ts}
 │   │   ├── services/{consume.ts, plans.ts, users.ts, usage.ts, accounts.ts}
 │   │   ├── domain/{rules.ts, month.ts, errors.ts, apiKeys.ts}
@@ -689,7 +698,7 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 │   ├── src/{server.ts, bootstrap.ts, provision.ts, scenario.ts, documents.ts, metering.ts, config.ts}
 │   ├── public/{index.html, style.css, app.js}
 │   └── scripts/smoke.ts
-├── load/{scenarios/*.js, verify.sql, run.sh, results/}
+├── load/{setup.ts, scenarios/*.js, lib/common.js, verify.sql, run.sh, run-all.sh, report.ts, results/}
 └── docs/{performance.md, api-examples.http}
 ```
 

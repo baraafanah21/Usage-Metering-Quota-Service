@@ -1,0 +1,42 @@
+{
+  "scenario": "plan-flip",
+  "cpuCores": {
+    "db": 1.05,
+    "api": 0.53,
+    "overSeconds": 61.2
+  },
+  "poolSamples": 120,
+  "dbPoolTotalMax": 20,
+  "dbPoolWaiting": {
+    "mean": 29.8,
+    "median": 30,
+    "max": 31
+  },
+  "consumeTxDuration": {
+    "count": 29064,
+    "meanMs": 41.04,
+    "p50Ms": 8.48,
+    "p95Ms": 212.24,
+    "p99Ms": 380.32
+  },
+  "consumePoolAcquire": {
+    "count": 29064,
+    "meanMs": 29.93,
+    "p50Ms": 23.46,
+    "p95Ms": 85.05,
+    "p99Ms": 97.11
+  },
+  "httpConsume200": {
+    "count": 29064,
+    "meanMs": 102.9,
+    "p50Ms": 80.95,
+    "p95Ms": 281.86,
+    "p99Ms": 463.63
+  },
+  "decisions": {
+    "accepted": 16767,
+    "rejected": 12297,
+    "replays": 0,
+    "idempotencyConflicts": 0
+  }
+}

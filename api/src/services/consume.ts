@@ -6,7 +6,7 @@ import {
   pgErrorCode,
   QUERY_CANCELED,
 } from "../db/errors.js";
-import { withTransaction } from "../db/tx.js";
+import { type TxTiming, withTransaction } from "../db/tx.js";
 import { AppError } from "../domain/errors.js";
 import {
   type Decision,
@@ -16,6 +16,13 @@ import {
   toRules,
   type Violation,
 } from "../domain/rules.js";
+import {
+  consumeDecisions,
+  consumeIdempotencyConflicts,
+  consumePoolAcquire,
+  consumeReplays,
+  consumeTxDuration,
+} from "../metrics.js";
 import {
   findRequest,
   insertRequest,
@@ -60,11 +67,13 @@ const TX_TIMEOUTS = "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout 
 export async function consume(pool: Pool, accountId: string, input: ConsumeInput): Promise<ConsumeResponse> {
   for (let attempt = 1; ; attempt++) {
     try {
-      return await withTransaction(pool, (client) => decide(client, accountId, input));
+      return counted(await withTransaction(pool, (client) => decide(client, accountId, input), observeTx));
     } catch (err) {
       // An identical request recorded its decision first and ours rolled back entirely,
       // including any counter increment. Answer with the winner's decision.
-      if (isUniqueViolation(err, LEDGER_REQUEST_UNIQUE)) return replayWinner(pool, accountId, input, err);
+      if (isUniqueViolation(err, LEDGER_REQUEST_UNIQUE)) {
+        return counted(await replayWinner(pool, accountId, input, err));
+      }
 
       const code = pgErrorCode(err);
       // Can't happen with the fixed lock order (account, then user), but Postgres has the
@@ -83,6 +92,25 @@ export async function consume(pool: Pool, accountId: string, input: ConsumeInput
       throw err;
     }
   }
+}
+
+function observeTx(timing: TxTiming): void {
+  consumePoolAcquire.observe(timing.acquire);
+  consumeTxDuration.observe(timing.tx);
+}
+
+/** Counts a committed outcome (§12): a new decision, or a replay of a recorded one. */
+function counted(response: ConsumeResponse): ConsumeResponse {
+  if (response.replayed) {
+    consumeReplays.inc();
+  } else {
+    consumeDecisions.inc({
+      decision: response.decision,
+      scope: response.reason?.scope ?? "none",
+      rule: response.reason?.rule ?? "none",
+    });
+  }
+  return response;
 }
 
 /** The whole decision, inside one transaction. Throwing anywhere rolls everything back. */
@@ -193,6 +221,7 @@ async function record(
  */
 function replayOf(stored: StoredRequest, input: ConsumeInput): ConsumeResponse {
   if (stored.externalId !== input.userId || stored.units !== input.units) {
+    consumeIdempotencyConflicts.inc();
     throw new AppError(
       409,
       "IDEMPOTENCY_CONFLICT",

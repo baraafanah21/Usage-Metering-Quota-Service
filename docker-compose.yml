@@ -7,6 +7,8 @@ x-admin-api-key: &admin-api-key ${ADMIN_API_KEY:-dev-admin-key-change-me-0123456
 services:
   db:
     image: postgres:16
+    # pg_stat_statements: per-statement timings for the load tests (docs/performance.md).
+    command: ["postgres", "-c", "shared_preload_libraries=pg_stat_statements"]
     environment:
       POSTGRES_USER: metering
       POSTGRES_PASSWORD: metering
@@ -92,6 +94,37 @@ services:
       interval: 2s
       timeout: 3s
       retries: 15
+
+  # Load testing (DESIGN.md §11), driven by load/run.sh. Both reach the api by service name.
+  # load-setup creates a scenario's accounts and writes their keys to load/.work/ (gitignored).
+  load-setup:
+    image: node:22.23.3-bookworm-slim
+    profiles: ["loadtest"]
+    # The host user, so files written to ./load are owned by whoever runs run.sh.
+    user: "${LOAD_UID:-1000}:${LOAD_GID:-1000}"
+    working_dir: /load
+    entrypoint: ["node", "setup.ts"]
+    environment:
+      API_URL: http://api:3000
+      ADMIN_API_KEY: *admin-api-key
+    volumes:
+      - ./load:/load
+    depends_on:
+      api:
+        condition: service_healthy
+
+  k6:
+    image: grafana/k6:2.3.0
+    profiles: ["loadtest"]
+    user: "${LOAD_UID:-1000}:${LOAD_GID:-1000}"
+    working_dir: /load
+    environment:
+      API_URL: http://api:3000
+    volumes:
+      - ./load:/load
+    depends_on:
+      api:
+        condition: service_healthy
 
 volumes:
   db-data:

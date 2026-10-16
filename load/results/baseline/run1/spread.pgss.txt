@@ -1,0 +1,18 @@
+ calls  | total_ms | mean_ms | max_ms |  rows  |                                                                    query                                                                     
+--------+----------+---------+--------+--------+----------------------------------------------------------------------------------------------------------------------------------------------
+ 106770 |  19882.5 |   0.186 |   25.2 | 106770 | INSERT INTO account_monthly_usage (account_id, month, used) VALUES ($1, $2::date, $3) ON CONFLICT (account_id, month) DO UPDATE SET used = a
+ 106770 |   8138.2 |   0.076 |    1.2 | 106770 | INSERT INTO usage_requests (account_id, user_id, request_id, units, decision, reject_scope, reject_rule, month, account_plan_id, account_pla
+ 106770 |   5012.0 |   0.047 |    2.5 | 106770 | UPDATE user_monthly_usage SET used = used + $4 WHERE account_id = $1 AND user_id = $2 AND month = $3::date
+ 106770 |   4838.1 |   0.045 |    0.8 | 106770 | UPDATE account_monthly_usage SET used = used + $3 WHERE account_id = $1 AND month = $2::date
+ 106770 |   3658.0 |   0.034 |    2.2 | 106770 | SELECT u.id, u.external_id, u.plan_id, u.created_at, up.name AS up_name, up.version AS up_version, ur.monthly AS up_monthly, ur.per_request 
+ 106770 |   3310.2 |   0.031 |    0.9 | 106770 | INSERT INTO user_monthly_usage (user_id, account_id, month, used) VALUES ($2, $1, $3::date, $4) ON CONFLICT (user_id, month) DO UPDATE SET u
+ 106770 |   1139.0 |   0.011 |    1.0 |      0 | SELECT u.external_id, r.units, r.evaluation FROM usage_requests r JOIN users u ON u.id = r.user_id AND u.account_id = r.account_id WHERE r.a
+ 106770 |    838.1 |   0.008 |    0.6 | 106770 | SELECT account_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL
+ 106770 |    374.6 |   0.004 |    0.8 |      0 | SET LOCAL lock_timeout = '2s'
+ 106770 |     91.8 |   0.001 |    0.0 |      0 | SET LOCAL statement_timeout = '5s'
+ 106770 |     42.8 |   0.000 |    0.1 |      0 | COMMIT
+ 106770 |     38.1 |   0.000 |    0.0 |      0 | BEGIN
+     29 |      0.3 |   0.009 |    0.0 |     29 | SELECT $2 FROM schema_migrations WHERE version = $1
+      1 |      0.1 |   0.067 |    0.1 |      1 | SELECT pg_stat_statements_reset()
+(14 rows)
+

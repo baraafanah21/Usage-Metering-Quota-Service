@@ -2,7 +2,7 @@
 
 An HTTP service that decides, before an application processes a unit of work, whether an account and one of its users still have quota for it. Each account and each user has a plan (a monthly allowance and a per-request limit). A consume call is accepted only if both levels pass, and every decision goes into a ledger. It is built with TypeScript, Express 5 and PostgreSQL 16, and correctness under concurrency is enforced by the database. See [DESIGN.md](DESIGN.md) for the full design. It is the source of truth for this project.
 
-> Status: Phase 5. Accounts, API keys, plans, users, effective limits, `POST /v1/consume`, monthly usage, decision history and the demo app exist. Load testing comes next. See [DESIGN.md §18](DESIGN.md#18-build-order).
+> Status: Phase 6a. Accounts, API keys, plans, users, effective limits, `POST /v1/consume`, monthly usage, decision history, the demo app, Prometheus metrics and the load-test harness with baseline numbers exist. Optimizations measured against that baseline come next. See [DESIGN.md §18](DESIGN.md#18-build-order).
 
 ## Run it
 
@@ -19,6 +19,7 @@ This starts three services: `db`, `api` and `demo`. Open the demo at **http://lo
 | ---------------------------- | ------------- | -------------------------------------------------------------- |
 | `GET /health/live`           | none          | 200 while the process is up                                    |
 | `GET /health/ready`          | none          | 200 if the database answers and the latest migration is applied, else 503 |
+| `GET /metrics`               | none          | Prometheus metrics: request latency by route pattern, consume decisions, transaction and pool timings ([DESIGN.md §12](DESIGN.md#12-observability)) |
 | `POST /v1/admin/accounts`    | `X-Admin-Key` | Create an account `{ name, planId? }`; returns its first API key, once |
 | `GET /v1/account`            | `X-API-Key`   | The caller's account, its plan, and this month's used/remaining |
 | `PUT /v1/account/plan`       | `X-API-Key`   | Switch to a predefined or own custom account plan `{ planId }` |
@@ -209,3 +210,14 @@ npm test
 The suite migrates and seeds that database itself before the first test. Each test creates its own fresh account, so tests never share data and nothing needs cleaning up. To use a different database, set `TEST_DATABASE_URL`. The test suite ignores `DATABASE_URL` on purpose, so it can never run against the dev database.
 
 Other scripts in `api/`: `npm run dev` (watch mode, reads `../.env`), `npm run build`, `npm start`, `npm run typecheck`.
+
+## Load tests
+
+k6 scenarios for throughput and correctness under contention ([DESIGN.md §11](DESIGN.md#11-performance-plan)). They need Docker with Compose v2, bash and curl; k6 and the setup script run in containers (compose profile `loadtest`).
+
+```sh
+load/run.sh hot-account baseline       # one scenario: fresh accounts → k6 → verify.sql → one-line summary
+load/run-all.sh baseline 3             # every scenario 3 times, each on a fresh stack, then medians
+```
+
+`run.sh` starts `db` and `api` if needed, and with `FRESH_STACK=1` first runs `docker compose down -v`, which deletes the dev database and the demo's data. Results go to `load/results/<label>/`. After every run, `load/verify.sql` checks the counters against the ledger over the whole database and fails the run if anything is off. The baseline numbers, how long each scenario takes and the bottleneck analysis are in [docs/performance.md](docs/performance.md).

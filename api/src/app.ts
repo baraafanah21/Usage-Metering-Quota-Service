@@ -3,11 +3,13 @@ import type { Pool } from "pg";
 import type { Logger } from "pino";
 import { requireAdminKey, requireApiKey } from "./http/middleware/auth.js";
 import { errorHandler, notFoundHandler } from "./http/middleware/errors.js";
+import { httpMetrics } from "./http/middleware/httpMetrics.js";
 import { requestLogger } from "./http/middleware/requestLogger.js";
 import { accountRouter } from "./http/routes/account.js";
 import { adminRouter } from "./http/routes/admin.js";
 import { consumeRouter } from "./http/routes/consume.js";
 import { healthRouter } from "./http/routes/health.js";
+import { metricsRouter } from "./http/routes/metrics.js";
 import { plansRouter } from "./http/routes/plans.js";
 import { requestsRouter } from "./http/routes/requests.js";
 import { usageRouter } from "./http/routes/usage.js";
@@ -26,9 +28,11 @@ export function createApp({ pool, logger, adminApiKey }: AppDeps): Express {
   app.disable("x-powered-by");
 
   app.use(requestLogger(logger));
+  app.use(httpMetrics());
   app.use(express.json({ limit: "100kb" }));
 
   app.use("/health", healthRouter(pool));
+  app.use("/metrics", metricsRouter(pool));
 
   const v1 = Router();
   // Admin first: it has its own guard and must not require an account API key.
