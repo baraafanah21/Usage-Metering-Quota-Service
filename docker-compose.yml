@@ -1,5 +1,9 @@
 name: metering
 
+# One value for both the api and the demo (which plays the operator to create accounts).
+# Dev-only default so a fresh clone starts; set ADMIN_API_KEY in .env for anything real.
+x-admin-api-key: &admin-api-key ${ADMIN_API_KEY:-dev-admin-key-change-me-0123456789abcdef}
+
 services:
   db:
     image: postgres:16
@@ -22,8 +26,7 @@ services:
     environment:
       DATABASE_URL: postgres://metering:metering@db:5432/metering
       PORT: "3000"
-      # Dev-only default so a fresh clone starts; set ADMIN_API_KEY in .env for anything real.
-      ADMIN_API_KEY: ${ADMIN_API_KEY:-dev-admin-key-change-me-0123456789abcdef}
+      ADMIN_API_KEY: *admin-api-key
       LOG_LEVEL: ${LOG_LEVEL:-info}
       DB_POOL_MAX: ${DB_POOL_MAX:-20}
     ports:
@@ -31,6 +34,45 @@ services:
     depends_on:
       db:
         condition: service_healthy
+    # The image has no curl; Node 22's fetch does the same job.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:3000/health/ready').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
+
+  # Demo client app: http://localhost:8080. Holds DocuCorp's API key; the browser never sees it.
+  demo:
+    build: ./demo-app
+    environment:
+      METERING_API_URL: http://api:3000
+      ADMIN_API_KEY: *admin-api-key
+      PORT: "8080"
+      DATA_DIR: /data
+    volumes:
+      # DocuCorp's API key (shown by the API only once) survives restarts here.
+      - demo-data:/data
+    ports:
+      - "8080:8080"
+    depends_on:
+      api:
+        condition: service_healthy
+    # Healthy once DocuCorp is set up, so `docker compose up --wait` means "ready to demo".
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://localhost:8080/health/ready').then((r) => process.exit(r.ok ? 0 : 1), () => process.exit(1))"
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
 
   # Separate, disposable database for the test suite:
   #   docker compose --profile test up -d db-test
@@ -53,3 +95,4 @@ services:
 
 volumes:
   db-data:
+  demo-data:
