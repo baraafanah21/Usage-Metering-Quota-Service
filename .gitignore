@@ -7,3 +7,5 @@ coverage/
 !.env.example
 .DS_Store
 .data/
+# Load-test setup output: contains API keys (load/setup.ts)
+load/.work/
