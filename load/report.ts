@@ -111,6 +111,7 @@ function metrics(dir: string, scenario: string): void {
     },
     consumeTxDuration: histogramDelta(before, after, "consume_tx_duration_seconds"),
     consumePoolAcquire: histogramDelta(before, after, "consume_pool_acquire_seconds"),
+    consumeLockHold: histogramDelta(before, after, "consume_lock_hold_seconds"),
     httpConsume200: histogramDelta(before, after, "http_request_duration_seconds", { route: "/v1/consume", method: "POST", status: "200" }),
     decisions: {
       accepted: delta("consume_decisions_total", { decision: "accepted" }),
@@ -135,6 +136,7 @@ interface RunNumbers {
   poolWaitingMean: number | null;
   txMeanMs: number | null;
   acquireMeanMs: number | null;
+  lockHoldMeanMs: number | null;
   dbCpuCores: number;
   apiCpuCores: number;
 }
@@ -155,6 +157,8 @@ function runNumbers(dir: string, scenario: string): RunNumbers {
     poolWaitingMean: m.dbPoolWaiting.mean,
     txMeanMs: m.consumeTxDuration.meanMs,
     acquireMeanMs: m.consumePoolAcquire.meanMs,
+    // Absent in results recorded before the metric existed (Phase 6a baseline).
+    lockHoldMeanMs: m.consumeLockHold?.meanMs ?? null,
     dbCpuCores: m.cpuCores.db,
     apiCpuCores: m.cpuCores.api,
   };
@@ -167,7 +171,7 @@ function line(dir: string, scenario: string): void {
   console.log(
     `${scenario} [${dir}]: ${fmt(r.rps, 0)} req/s, p50 ${fmt(r.p50)} ms, p95 ${fmt(r.p95)} ms, p99 ${fmt(r.p99)} ms, ` +
       `errors ${fmt(r.errorRate * 100, 2)}% of ${r.requests}, pool waiting avg ${fmt(r.poolWaitingMean)}, ` +
-      `tx ${fmt(r.txMeanMs, 2)} ms, acquire ${fmt(r.acquireMeanMs, 2)} ms, ` +
+      `tx ${fmt(r.txMeanMs, 2)} ms, acquire ${fmt(r.acquireMeanMs, 2)} ms, lock hold ${fmt(r.lockHoldMeanMs, 2)} ms, ` +
       `CPU cores db ${fmt(r.dbCpuCores, 2)} api ${fmt(r.apiCpuCores, 2)}, verify ${r.verified ? "✅" : "❌"}`,
   );
 }
@@ -185,8 +189,8 @@ function medians(dir: string): void {
   const runs = readdirSync(dir).filter((d) => /^run\d+$/.test(d)).sort();
   const rows: Record<string, unknown>[] = [];
   const md = [
-    `| Scenario | Runs | Req/s | p50 ms | p95 ms | p99 ms | Error rate | Pool waiting (avg) | Tx mean ms | Acquire mean ms | CPU db | CPU api | verify.sql |`,
-    `| --- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | :-: |`,
+    `| Scenario | Runs | Req/s | p50 ms | p95 ms | p99 ms | Error rate | Pool waiting (avg) | Tx mean ms | Acquire mean ms | Lock hold mean ms | CPU db | CPU api | verify.sql |`,
+    `| --- | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | --: | :-: |`,
   ];
   for (const scenario of SCENARIOS) {
     const per = runs.filter((r) => existsSync(`${dir}/${r}/${scenario}.json`)).map((r) => runNumbers(`${dir}/${r}`, scenario));
@@ -203,6 +207,7 @@ function medians(dir: string): void {
       poolWaitingMean: pick("poolWaitingMean"),
       txMeanMs: pick("txMeanMs"),
       acquireMeanMs: pick("acquireMeanMs"),
+      lockHoldMeanMs: pick("lockHoldMeanMs"),
       dbCpuCores: pick("dbCpuCores"),
       apiCpuCores: pick("apiCpuCores"),
       verified: per.every((p) => p.verified),
@@ -211,7 +216,7 @@ function medians(dir: string): void {
     rows.push(row);
     md.push(
       `| ${scenario} | ${per.length} | ${fmt(row.rps, 0)} | ${fmt(row.p50)} | ${fmt(row.p95)} | ${fmt(row.p99)} | ` +
-        `${fmt((row.errorRate ?? 0) * 100, 2)}% | ${fmt(row.poolWaitingMean)} | ${fmt(row.txMeanMs, 2)} | ${fmt(row.acquireMeanMs, 2)} | ${fmt(row.dbCpuCores, 2)} | ${fmt(row.apiCpuCores, 2)} | ` +
+        `${fmt((row.errorRate ?? 0) * 100, 2)}% | ${fmt(row.poolWaitingMean)} | ${fmt(row.txMeanMs, 2)} | ${fmt(row.acquireMeanMs, 2)} | ${fmt(row.lockHoldMeanMs, 2)} | ${fmt(row.dbCpuCores, 2)} | ${fmt(row.apiCpuCores, 2)} | ` +
         `${row.verified ? "✅" : "❌"} ${per.filter((p) => p.verified).length}/${per.length} |`,
     );
   }

@@ -334,14 +334,14 @@ sequenceDiagram
     participant A as API
     participant P as Postgres
     C->>A: POST /v1/consume (X-API-Key, userId, units, requestId)
-    A->>A: validate body, resolve key → accountId (LRU cache, 30s TTL)
-    A->>P: BEGIN
-    A->>P: SELECT ledger WHERE account_id, request_id
+    A->>P: resolve key → accountId (1 query; no cache, §7)
+    A->>A: validate body
+    A->>P: BEGIN + SET LOCAL lock_timeout, statement_timeout (1 round trip)
+    A->>P: SELECT ledger row for (account_id, request_id) + user + user plan rules + account plan rules (1 query)
     alt already exists
         A->>P: COMMIT
         A-->>C: stored decision (replayed: true) or 409 if payload differs
     end
-    A->>P: SELECT user + user plan rules + account plan rules (1 query)
     alt user not in this account
         A-->>C: 404 USER_NOT_FOUND (nothing recorded)
     end
@@ -351,13 +351,9 @@ sequenceDiagram
         A->>P: COMMIT
         A-->>C: 200 rejected
     end
-    A->>P: upsert+lock account counter row (FOR UPDATE)
-    A->>P: upsert+lock user counter row (FOR UPDATE)
+    A->>P: upsert+lock account counter row, then user counter row (1 statement)
     A->>A: evaluate monthly rules
-    alt accepted
-        A->>P: UPDATE both counters (+units)
-    end
-    A->>P: INSERT ledger row
+    A->>P: INSERT ledger row + UPDATE both counters if accepted (1 statement)
     A->>P: COMMIT
     A-->>C: 200 decision
 ```
@@ -365,13 +361,22 @@ sequenceDiagram
 ### 6.3 Locking — why it's correct
 
 - **Isolation level: `READ COMMITTED`** + explicit row locks. Every check that matters (monthly allowance) reads a counter row **after locking it**, so it sees the latest committed value. Two concurrent requests for the same account serialize on the account row; the second one sees the first one's increment. This is exactly the race the brief is testing.
-- **Lock acquisition** in one statement, which also creates the row on first use of the month:
+- **Lock acquisition**: both counter rows in one statement, which also creates them on first use of the month (`lockCounters`, `repositories/usage.ts`):
   ```sql
-  INSERT INTO account_monthly_usage (account_id, month, used) VALUES ($1, $2, 0)
-  ON CONFLICT (account_id, month) DO UPDATE SET used = account_monthly_usage.used
-  RETURNING used;      -- row is now locked until COMMIT
+  WITH account_row AS (
+    INSERT INTO account_monthly_usage (account_id, month, used) VALUES ($1, $3, 0)
+    ON CONFLICT (account_id, month) DO UPDATE SET used = account_monthly_usage.used
+    RETURNING used                                    -- account row locked until COMMIT
+  ), user_row AS (
+    INSERT INTO user_monthly_usage (user_id, account_id, month, used)
+    SELECT $2, $1, $3, 0 FROM account_row             -- needs account_row's row first
+    ON CONFLICT (user_id, month) DO UPDATE SET used = user_monthly_usage.used
+    RETURNING used                                    -- user row locked until COMMIT
+  )
+  SELECT account_row.used, user_row.used FROM account_row, user_row;
   ```
-- **Fixed lock order: account row, then user row.** Every transaction follows it → no deadlock cycles possible.
+- **Fixed lock order: account row, then user row.** Every transaction follows it → no deadlock cycles possible. Inside the statement above, the sub-statements of a `WITH` have no guaranteed order, so the order is forced by data: the user `INSERT` reads its row from `account_row`, which exists only once the account row is locked. `test/concurrency/lockOrder.test.ts` blocks the user row from outside and checks that the waiting statement already holds the account row.
+- **Recording** (`recordDecision`, `repositories/requests.ts`): the ledger `INSERT` and, for an accepted decision, both counter increments are one statement (data-modifying CTEs), so the ledger and both counters change together or not at all. From the lock to `COMMIT` that is 3 round trips: lock both, record, `COMMIT` (Phase 6b, `docs/performance.md`).
 - **Rejections on per-request limits take no counter locks** → a misbehaving client spamming oversized requests can't slow down everyone else on the account. To fill `used`/`remaining` in the response, such a rejection reads both counters with a plain `SELECT` (no lock). That read is **for display only**: the decision depends only on `units` and the per-request limits, so a concurrent increment that the read misses cannot make the decision wrong. The shown numbers may be a few milliseconds stale.
 - **Rejections on monthly limits** do take the locks briefly (they had to read the counter), but write nothing to counters.
 - **Why not `SERIALIZABLE`?** It would also be correct, but under contention it aborts transactions (serialization failures) that we'd have to retry in a loop, wasting work exactly when load is highest. Pessimistic row locks give the same guarantee with queueing instead of retry storms.
@@ -407,7 +412,8 @@ Plans and assignments are read **inside** the consume transaction, with no cache
 | **Operator** | `X-Admin-Key` (from env `ADMIN_API_KEY`) | Create accounts (receives the account's first API key).           |
 | **Account**  | `X-API-Key: mk_<base62 32 bytes>`        | Everything about _its own_ account, plans, users, usage, history. |
 
-- **API key lifecycle:** generated with `crypto.randomBytes(32)`; shown **once** in the creation response; only `sha256` stored. Optional rotation: `POST /v1/account/api-keys` (new key) and `DELETE /v1/account/api-keys/:id` (revoke). Revoked keys fail immediately (cache entry removed on revoke; 30s TTL bounds staleness for multiple instances — documented).
+- **API key lifecycle:** generated with `crypto.randomBytes(32)`; shown **once** in the creation response; only `sha256` stored. Optional rotation (`POST /v1/account/api-keys`, `DELETE /v1/account/api-keys/:id`) is not built. Today a key is revoked by setting `api_keys.revoked_at` in the database.
+- **No API key cache.** Every request looks its key up (`SELECT … FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`, ~0.01 ms in Postgres), so a revoked key fails on the next request. Phase 6b built an in-process LRU cache with a 30 s TTL and measured it: no throughput gain in any scenario (interleaved A/B on spread: 2,223 vs 2,204 req/s), so it was reverted, along with its staleness window (`docs/performance.md`, step 3).
 - **Enforcement point:** an Express `requireApiKey` middleware, mounted on the `/v1` router before every account route, resolves the key → `req.accountId` (typed through a `Request` declaration merge). A separate `requireAdminKey` middleware guards `/v1/admin`. Missing → `401 MISSING_API_KEY`; unknown/revoked → `401 INVALID_API_KEY` (same response timing; no hint which).
 - **Tenant scoping rule:** the account id **never comes from the URL or body**. Every repository function takes `accountId` as its first parameter and every query has `WHERE account_id = $1`. Users are addressed by `externalId`, resolved as `WHERE account_id = $1 AND external_id = $2`.
 - **Auth runs before routing.** `requireApiKey` is mounted on the whole `/v1` router, so an unknown path under `/v1` returns `401 MISSING_API_KEY` without a key, and `404 NOT_FOUND` only once a valid key is sent. Without a key, a caller can't use 404-vs-401 to discover which routes exist. `/v1/admin/*` has its own guard and its own 404, so it never falls through to the account-key guard.
@@ -607,11 +613,11 @@ After every run a **verification script** (`load/verify.sql`) checks over the wh
 ### 11.3 Iterations (measure → change one thing → re-measure → record in `docs/performance.md`)
 
 1. **Baseline:** straightforward multi-statement transaction. Measured in Phase 3b: 10 round trips per consume (the API-key lookup, then `BEGIN`, timeouts, idempotency lookup, user + plans, account lock, user lock, two increments, ledger insert, `COMMIT`); 5 of them while holding the account row lock. Numbers: `docs/performance.md`.
-2. **API-key cache:** in-process LRU (30s TTL) → removes 1 query per request.
+2. **API-key cache:** in-process LRU (30s TTL) → removes 1 query per request. _Measured in Phase 6b and not kept: no gain, and it would let a revoked key work for up to 30 s._
 3. **Fewer round trips:** user + both plans' rules in one query; counter upsert+lock merged (`INSERT … ON CONFLICT DO UPDATE … RETURNING`).
 4. **Stateless pre-check before locks** (already in design; measure the gain on the oversized-request mix).
 5. **Single round trip:** move the locked section into one SQL statement (data-modifying CTE) or a PL/pgSQL function → the lock is held for ~one network round trip less. Compare honestly; keep it only if the gain justifies moving logic into SQL.
-6. **Pool size tuning:** sweep `max` (5/10/20/50) and show where more connections stop helping (contention, not connections, is the limit).
+6. **Pool size tuning:** sweep `max` (5/10/20/50) and show where more connections stop helping (contention, not connections, is the limit). _Done in Phase 6b (10/20/40/60): one hot account is flat at every size, and only its tail latency grows; many accounts gain up to ~40, then the API's single thread is the limit. Default kept at 20._
 
 Results table per iteration: RPS, p50/p95/p99, error rate, invariant check ✅/❌, plus a short "what we learned".
 
@@ -632,7 +638,7 @@ Recorded in Phase 3b as a mutation check on the concurrency test "allowance 100,
 - **Metrics** (`GET /metrics`, prom-client, no auth like `/health`; one registry per process, `src/metrics.ts`):
   - `http_request_duration_seconds{route,method,status}`: `route` is the pattern (`/v1/users/:externalId/limits`), never the raw path, so user ids don't create series. Requests that match no route (unknown paths, 401 from the `/v1` key guard) are `route="unmatched"`.
   - `consume_decisions_total{decision,scope,rule}`: new decisions only; `scope`/`rule` are `none` when accepted. `consume_replays_total`, `consume_idempotency_conflicts_total`.
-  - `consume_tx_duration_seconds`: `BEGIN` to `COMMIT`/`ROLLBACK` on a connection already acquired, so it includes row-lock waits but not pool queueing. `consume_pool_acquire_seconds`: the wait for a pool connection before `BEGIN`. Separating the two is what lets the load tests say where time goes (§11).
+  - `consume_tx_duration_seconds`: `BEGIN` to `COMMIT`/`ROLLBACK` on a connection already acquired, so it includes row-lock waits but not pool queueing. `consume_pool_acquire_seconds`: the wait for a pool connection before `BEGIN`. Separating the two is what lets the load tests say where time goes (§11). `consume_lock_hold_seconds` (Phase 6b): from the response of the statement that locks the account row to the end of `COMMIT`, i.e. how long a consume held the row that serializes its account (it starts on the response, so it reads about half a round trip low).
   - `db_pool_total`, `db_pool_idle`, `db_pool_waiting`: read from the pool when `/metrics` is scraped.
   - Default Node process metrics (CPU, memory, event-loop lag, GC).
 - **Health:** `/health/live` (process up), `/health/ready` (`SELECT 1` succeeds + migrations applied).
@@ -727,7 +733,7 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 ## 17. Known Limitations (honest list for the review)
 
 - Per-account throughput is capped by a single hot row (§11.4).
-- API-key cache can serve a revoked key for up to 30 s on _other_ instances (single instance here: revocation is immediate).
+- API keys can be revoked only in the database (`revoked_at`); there is no rotation or revoke endpoint (§7).
 - Requests in flight during a plan update may use the previous version (§6.5) — recorded, not hidden.
 - Ledger is unpartitioned; idempotency keys are kept forever.
 - No rate limiting of the API itself (different from quota), no RBAC, no billing.

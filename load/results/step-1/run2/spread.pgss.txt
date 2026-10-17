@@ -1,0 +1,15 @@
+ calls  | total_ms | mean_ms | max_ms |  rows  |                                                                    query                                                                     
+--------+----------+---------+--------+--------+----------------------------------------------------------------------------------------------------------------------------------------------
+ 120167 |  17743.2 |   0.148 |   23.1 | 120167 | WITH account_row AS ( INSERT INTO account_monthly_usage (account_id, month, used) VALUES ($1, $3::date, $4) ON CONFLICT (account_id, month) 
+ 120167 |  16165.0 |   0.135 |    2.9 | 120167 | WITH account_increment AS ( UPDATE account_monthly_usage SET used = used + $4 WHERE account_id = $1 AND month = $8::date AND $5::decision = 
+ 120167 |   4035.0 |   0.034 |    1.9 | 120167 | SELECT u.id, u.external_id, u.plan_id, u.created_at, up.name AS up_name, up.version AS up_version, ur.monthly AS up_monthly, ur.per_request 
+ 120167 |   1201.4 |   0.010 |    1.5 |      0 | SELECT u.external_id, r.units, r.evaluation FROM usage_requests r JOIN users u ON u.id = r.user_id AND u.account_id = r.account_id WHERE r.a
+ 120167 |    934.5 |   0.008 |    0.2 | 120167 | SELECT account_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL
+ 120167 |    422.0 |   0.004 |    0.2 |      0 | SET LOCAL lock_timeout = '2s'
+ 120167 |    109.9 |   0.001 |    0.1 |      0 | SET LOCAL statement_timeout = '5s'
+ 120167 |     47.9 |   0.000 |    0.0 |      0 | COMMIT
+ 120167 |     42.8 |   0.000 |    0.0 |      0 | BEGIN
+     29 |      0.3 |   0.010 |    0.0 |     29 | SELECT $2 FROM schema_migrations WHERE version = $1
+      1 |      0.1 |   0.074 |    0.1 |      1 | SELECT pg_stat_statements_reset()
+(11 rows)
+

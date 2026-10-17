@@ -1,5 +1,6 @@
 import type { Queryable } from "../db/tx.js";
 import type { Decision, RuleType, Scope } from "../domain/rules.js";
+import { toUserWithPlans, USER_WITH_PLANS_SQL, type UserWithPlans, type UserWithPlansRow } from "./users.js";
 
 /** The UNIQUE (account_id, request_id) constraint from 001_init.sql: the idempotency key. */
 export const LEDGER_REQUEST_UNIQUE = "usage_requests_account_id_request_id_key";
@@ -175,13 +176,66 @@ export async function findRequest(
 }
 
 /**
- * Appends one decision. Raises unique_violation on LEDGER_REQUEST_UNIQUE when the same
- * requestId was recorded first by a concurrent request; the caller's transaction then
- * rolls back, taking any counter increment with it.
+ * Both lookups consume makes before deciding, in one round trip: the decision already
+ * recorded for this requestId (findRequest), and the user with both plans
+ * (findUserWithPlans). Either may be missing. The two are independent; the outer query only
+ * puts their (at most one) rows side by side.
+ *
+ * MATERIALIZED makes Postgres plan the two lookups separately. Inlined, it searched join
+ * orders across all ~9 relations at once: 0.7 ms of planning per call, against 0.19 ms for
+ * the two queries on their own (0.3 ms materialized). See docs/performance.md, Phase 6b step 2.
  */
-export async function insertRequest(accountId: string, row: NewLedgerRow, db: Queryable): Promise<void> {
+export async function findConsumeContext(
+  accountId: string,
+  externalId: string,
+  requestId: string,
+  db: Queryable,
+): Promise<{ stored: StoredRequest | undefined; found: UserWithPlans | undefined }> {
+  const { rows } = await db.query<
+    Partial<UserWithPlansRow> & { stored_external_id: string | null; stored_units: string | null; stored_evaluation: unknown }
+  >(
+    `WITH found AS MATERIALIZED (${USER_WITH_PLANS_SQL}),
+     stored AS MATERIALIZED (
+       SELECT u.external_id, r.units, r.evaluation
+       FROM usage_requests r
+       JOIN users u ON u.id = r.user_id AND u.account_id = r.account_id
+       WHERE r.account_id = $1 AND r.request_id = $3
+     )
+     SELECT found.*,
+            stored.external_id AS stored_external_id, stored.units AS stored_units, stored.evaluation AS stored_evaluation
+     FROM (SELECT) AS one
+     LEFT JOIN found ON true
+     LEFT JOIN stored ON true`,
+    [accountId, externalId, requestId],
+  );
+  const r = rows[0]!;
+  return {
+    stored:
+      r.stored_external_id === null
+        ? undefined
+        : { externalId: r.stored_external_id, units: Number(r.stored_units), response: r.stored_evaluation },
+    found: r.id ? toUserWithPlans(r as UserWithPlansRow) : undefined,
+  };
+}
+
+/**
+ * Appends one decision to the ledger and, if it was accepted, adds its units to the account's
+ * and the user's counters: one statement, so both counters and the ledger change together or
+ * not at all. An accepted decision was evaluated against counter rows locked by lockCounters,
+ * which this transaction still holds. Raises unique_violation on LEDGER_REQUEST_UNIQUE when the
+ * same requestId was recorded first by a concurrent request; the statement and the caller's
+ * transaction then roll back, increments included.
+ */
+export async function recordDecision(accountId: string, row: NewLedgerRow, db: Queryable): Promise<void> {
   await db.query(
-    `INSERT INTO usage_requests
+    `WITH account_increment AS (
+       UPDATE account_monthly_usage SET used = used + $4
+       WHERE account_id = $1 AND month = $8::date AND $5::decision = 'accepted'
+     ), user_increment AS (
+       UPDATE user_monthly_usage SET used = used + $4
+       WHERE account_id = $1 AND user_id = $2 AND month = $8::date AND $5::decision = 'accepted'
+     )
+     INSERT INTO usage_requests
        (account_id, user_id, request_id, units, decision, reject_scope, reject_rule, month,
         account_plan_id, account_plan_version, user_plan_id, user_plan_version, evaluation)
      VALUES ($1, $2, $3, $4, $5, $6, $7, $8::date, $9, $10, $11, $12, $13)`,

@@ -19,18 +19,20 @@ import {
 import {
   consumeDecisions,
   consumeIdempotencyConflicts,
+  consumeLockHold,
   consumePoolAcquire,
   consumeReplays,
   consumeTxDuration,
 } from "../metrics.js";
 import {
+  findConsumeContext,
   findRequest,
-  insertRequest,
+  recordDecision,
   LEDGER_REQUEST_UNIQUE,
   type StoredRequest,
 } from "../repositories/requests.js";
-import { incrementCounters, lockAccountCounter, lockUserCounter, readCounters } from "../repositories/usage.js";
-import { findUserWithPlans, type UserWithPlans } from "../repositories/users.js";
+import { lockCounters, readCounters } from "../repositories/usage.js";
+import type { UserWithPlans } from "../repositories/users.js";
 import { type LevelLimits, levelLimits, userNotFound } from "./users.js";
 
 export interface ConsumeInput {
@@ -58,6 +60,7 @@ export interface ConsumeResponse {
 
 // Bounds on how long one consume may wait under contention (§10). Both are SET LOCAL, so
 // they end with the transaction and never leak to the next user of the pooled connection.
+// Sent together with BEGIN.
 const TX_TIMEOUTS = "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout = '5s'";
 
 /**
@@ -66,8 +69,20 @@ const TX_TIMEOUTS = "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout 
  */
 export async function consume(pool: Pool, accountId: string, input: ConsumeInput): Promise<ConsumeResponse> {
   for (let attempt = 1; ; attempt++) {
+    // Set by decide() once the account row is locked; the lock is held until COMMIT ends.
+    let lockedAt: number | undefined;
+    const observeTx = (timing: TxTiming) => {
+      consumePoolAcquire.observe(timing.acquire);
+      consumeTxDuration.observe(timing.tx);
+      if (lockedAt !== undefined) consumeLockHold.observe((performance.now() - lockedAt) / 1000);
+    };
     try {
-      return counted(await withTransaction(pool, (client) => decide(client, accountId, input), observeTx));
+      const response = await withTransaction(
+        pool,
+        (client) => decide(client, accountId, input, () => (lockedAt = performance.now())),
+        { setup: TX_TIMEOUTS, observe: observeTx },
+      );
+      return counted(response);
     } catch (err) {
       // An identical request recorded its decision first and ours rolled back entirely,
       // including any counter increment. Answer with the winner's decision.
@@ -94,11 +109,6 @@ export async function consume(pool: Pool, accountId: string, input: ConsumeInput
   }
 }
 
-function observeTx(timing: TxTiming): void {
-  consumePoolAcquire.observe(timing.acquire);
-  consumeTxDuration.observe(timing.tx);
-}
-
 /** Counts a committed outcome (§12): a new decision, or a replay of a recorded one. */
 function counted(response: ConsumeResponse): ConsumeResponse {
   if (response.replayed) {
@@ -114,19 +124,24 @@ function counted(response: ConsumeResponse): ConsumeResponse {
 }
 
 /** The whole decision, inside one transaction. Throwing anywhere rolls everything back. */
-async function decide(client: PoolClient, accountId: string, input: ConsumeInput): Promise<ConsumeResponse> {
-  await client.query(TX_TIMEOUTS);
+async function decide(
+  client: PoolClient,
+  accountId: string,
+  input: ConsumeInput,
+  onLocked: () => void,
+): Promise<ConsumeResponse> {
+  // 1-2. Both lookups in one round trip: the decision already recorded for this requestId,
+  //    and the user with both plans that apply, plus the month.
+  const { stored, found } = await findConsumeContext(accountId, input.userId, input.requestId, client);
 
   // 1. Idempotency. A requestId names one decision forever: if it is already recorded,
   //    return that decision (accepted or rejected) and touch nothing. Callers retry on
   //    timeouts, and this is what makes those retries safe (§6.4).
-  const stored = await findRequest(accountId, input.requestId, client);
   if (stored) return replayOf(stored, input);
 
-  // 2. The user and both plans that apply, plus the month, in one query. Scoped by
-  //    accountId, so another account's user is simply not found. Nothing is recorded for
-  //    an unknown user, so the caller can register it and resend the same requestId.
-  const found = await findUserWithPlans(accountId, input.userId, client);
+  // 2. The user lookup is scoped by accountId, so another account's user is simply not
+  //    found. Nothing is recorded for an unknown user, so the caller can register it and
+  //    resend the same requestId.
   if (!found) throw userNotFound(input.userId);
   const accountRules = toRules(found.accountPlan.rules);
   const userRules = toRules(found.userPlan.rules);
@@ -144,11 +159,12 @@ async function decide(client: PoolClient, accountId: string, input: ConsumeInput
     return record(client, accountId, input, found, stateless, used);
   }
 
-  // 4. Lock the account counter row, then the user's. The account row is the one that
-  //    serializes competing requests (§6.3), and the fixed order means no two consumes can
-  //    ever wait on each other in a cycle. Each statement also creates the month's row.
-  const accountUsed = await lockAccountCounter(accountId, found.month, client);
-  const userUsed = await lockUserCounter(accountId, found.user.id, found.month, client);
+  // 4. Lock the account counter row, then the user's, in one statement. The account row is
+  //    the one that serializes competing requests (§6.3), and the fixed order means no two
+  //    consumes can ever wait on each other in a cycle. It also creates the month's rows.
+  //    From here to COMMIT the account row is locked: 3 round trips (this, record, COMMIT).
+  const { accountUsed, userUsed } = await lockCounters(accountId, found.user.id, found.month, client);
+  onLocked();
 
   // 5. Evaluate every rule against counters nobody else can change until we commit.
   const evaluation = evaluate({
@@ -157,13 +173,9 @@ async function decide(client: PoolClient, accountId: string, input: ConsumeInput
     user: { rules: userRules, used: userUsed },
   });
 
-  // 6. Accepted: add the units at both levels, or at neither (no partial acceptance).
-  if (evaluation.decision === "accepted") {
-    await incrementCounters(accountId, found.user.id, found.month, input.units, client);
-  }
+  // 6-8. Record the decision and, if accepted, add the units at both levels, or at neither
+  //    (no partial acceptance), in one statement; withTransaction commits when this returns.
   const delta = evaluation.decision === "accepted" ? input.units : 0;
-
-  // 7-8. Record the decision; withTransaction commits when this returns.
   return record(client, accountId, input, found, evaluation, {
     accountUsed: accountUsed + delta,
     userUsed: userUsed + delta,
@@ -172,7 +184,8 @@ async function decide(client: PoolClient, accountId: string, input: ConsumeInput
 
 /**
  * Builds the response and appends it to the ledger with the plan versions it was evaluated
- * against. The stored body is the replay, so history survives later plan edits (§6.4).
+ * against; an accepted decision's units go to both counters in the same statement. The stored
+ * body is the replay, so history survives later plan edits (§6.4).
  */
 async function record(
   client: PoolClient,
@@ -194,7 +207,7 @@ async function record(
     replayed: false,
   };
 
-  await insertRequest(
+  await recordDecision(
     accountId,
     {
       userId: found.user.id,

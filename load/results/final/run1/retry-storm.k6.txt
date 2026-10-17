@@ -1,0 +1,50 @@
+
+
+  █ THRESHOLDS 
+
+    checks
+    ✓ 'rate>0.99' rate=100.00%
+
+    http_req_duration{name:consume}
+    ✓ 'p(99)<2000' p(99)=48.49ms
+
+    http_req_failed{name:consume}
+    ✓ 'rate<0.01' rate=0.00%
+
+    http_reqs{name:consume}
+    ✓ 'count>0' count=88707
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 88707   2954.935402/s
+    checks_succeeded...: 100.00% 88707 out of 88707
+    checks_failed......: 0.00%   0 out of 88707
+
+    ✓ consume: 200 with a decision
+
+    CUSTOM
+    consume_accepted...............: 88707 2954.935402/s
+    consume_replayed...............: 88607 2951.604284/s
+
+    HTTP
+    http_req_duration..............: avg=33.74ms min=13.32ms med=32.79ms max=441.17ms p(90)=37.02ms p(95)=39.58ms p(99)=48.49ms
+      { expected_response:true }...: avg=33.74ms min=13.32ms med=32.79ms max=441.17ms p(90)=37.02ms p(95)=39.58ms p(99)=48.49ms
+      { name:consume }.............: avg=33.74ms min=13.32ms med=32.79ms max=441.17ms p(90)=37.02ms p(95)=39.58ms p(99)=48.49ms
+    http_req_failed................: 0.00% 0 out of 88707
+      { name:consume }.............: 0.00% 0 out of 88707
+    http_reqs......................: 88707 2954.935402/s
+      { name:consume }.............: 88707 2954.935402/s
+
+    EXECUTION
+    iteration_duration.............: avg=33.82ms min=13.87ms med=32.87ms max=442.58ms p(90)=37.1ms  p(95)=39.66ms p(99)=48.57ms
+    iterations.....................: 88707 2954.935402/s
+    vus............................: 100   min=100        max=100
+    vus_max........................: 100   min=100        max=100
+
+    NETWORK
+    data_received..................: 74 MB 2.5 MB/s
+    data_sent......................: 21 MB 703 kB/s
+
+
+
