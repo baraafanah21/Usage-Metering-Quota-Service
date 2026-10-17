@@ -1,7 +1,7 @@
 # Usage Metering & Quota Service — System Design
 
-> Status: **Design, pre-implementation** · Stack: **TypeScript** (Node 22) + **Express 5** + **PostgreSQL 16** · One service, one database.
-> This document is the source of truth for implementation. Every decision here should be defensible in the review.
+> Status: **Implemented** (phases 1–7 of §18; §5.1 and key rotation are designed but not built) · Stack: **TypeScript** (Node 22) + **Express 5** + **PostgreSQL 16** · One service, one database.
+> This document is the source of truth for the implementation. Sections written before a phase was built have been updated to match the code; measured results are in `docs/performance.md`.
 
 ---
 
@@ -29,7 +29,7 @@
 | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
 | Component type   | Synchronous **HTTP API** (command + queries), called server-to-server by the client application's backend.                                    |
 | Callers          | (a) an **operator** (us) creating accounts with an admin key; (b) **account backends** using their API key. End users never call us directly. |
-| Latency budget   | Consume is on the caller's critical path ("before processing a document"). Target **p99 < 50 ms** under normal load on a laptop.              |
+| Latency budget   | Consume is on the caller's critical path ("before processing a document"). Target **p99 < 50 ms** under normal load on a laptop. Not measured as such: the load tests (§11) run at saturation, where latency is mostly queueing. |
 | Consistency need | **Strong.** Over-granting quota is the main correctness bug. We prefer a slightly slower correct answer over a fast wrong one.                |
 | Retry model      | Callers _will_ retry on timeouts → consume must be idempotent by `requestId`.                                                                 |
 | Scale assumption | Single node. Many accounts, but realistic contention is "many users of one account" hitting the same account counter.                         |
@@ -59,7 +59,7 @@ Why the demo app has its own backend: the brief says the _application's backend_
 
 ```
 http (Express routers, auth middleware, zod validation, error middleware)
-  └─> services (use-cases: consume, managePlans, manageUsers, queryUsage)
+  └─> services (use cases: consume, plans, users, usage, accounts)
         ├─> domain/rules   ← pure functions, no I/O, 100% unit-testable
         └─> repositories   ← SQL only, one file per aggregate
               └─> db (pool, tx helper, migrations, seed)
@@ -72,7 +72,7 @@ Rules know nothing about HTTP or SQL. Repositories know nothing about rules. The
 | Concern            | Choice                                                                                                             | Why                                                                                                                                                                                                                                                                                                                                                            |
 | ------------------ | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Language           | **TypeScript** (strict mode)                                                                                       | Types for the domain (rules, decisions, errors) catch mistakes before runtime and document the contracts between layers.                                                                                                                                                                                                                                       |
-| HTTP               | **Express 5**                                                                                                      | The framework the team already knows well, so time goes into correctness instead of learning a new tool. Express 5 forwards rejected promises from async handlers to the error middleware, so no `try/catch` per route. Framework speed is not the bottleneck: consume time is dominated by the account-row lock in Postgres (§11), which the load test shows. |
+| HTTP               | **Express 5**                                                                                                      | The framework the team already knows well, so time goes into correctness instead of learning a new tool. Express 5 forwards rejected promises from async handlers to the error middleware, so no `try/catch` per route. Framework speed is not the deciding factor: for one account the limit is the account-row lock in Postgres, and across many accounts it is Node's single JavaScript thread, not Express itself (§11, `docs/performance.md`). |
 | Validation / types | **zod**                                                                                                            | One schema → runtime validation + inferred TS types (`z.infer`). Used in a small `validate(schema)` middleware.                                                                                                                                                                                                                                                |
 | DB access          | **`pg` + raw SQL**                                                                                                 | The brief says "TypeScript and SQL". Locking semantics must be explicit and visible; ORMs hide `FOR UPDATE` and round trips.                                                                                                                                                                                                                                   |
 | Migrations         | Plain numbered `.sql` files + tiny runner with a `schema_migrations` table, run on startup under an advisory lock. | Zero magic; safe if two instances start.                                                                                                                                                                                                                                                                                                                       |
@@ -261,7 +261,8 @@ interface Violation {
   message: string;
 }
 
-// Each rule is a pure function. Adding a rule type = add one entry here.
+// Simplified; the full version (with the violation's actual value and message) is in
+// api/src/domain/rules.ts. Each rule is a pure function. Adding a rule type = add one entry here.
 const evaluators: Record<
   RuleType,
   (limit: number, ctx: RuleContext) => boolean
@@ -278,13 +279,13 @@ const evaluators: Record<
 3. `user.monthly_allowance`
 4. `account.monthly_allowance`
 
-Stateless rules first (they don't need counters → can reject **before taking any lock**), and within each class _user_ before _account_ because the user rule is the more specific explanation. All violations are computed and returned in `violations[]`; the first one in this order is the `primary` reason. This matches the brief's three examples exactly.
+Stateless rules first (they don't need counters → can reject **before taking any lock**), and within each class _user_ before _account_ because the user rule is the more specific explanation. All violations are computed and returned in `violations[]`; the first one in this order is the `reason`. This matches the brief's three examples exactly.
 
 **Remaining** at a level = `max(0, limit − used)` (or `null` = unlimited). Reducing a limit below usage shows `0` and rejects further consumption — no negative numbers, no special case.
 
-### 5.1 Optional extra rule (stretch, only after the core is done)
+### 5.1 Optional extra rule (not built)
 
-`daily_allowance` — fits the same model: a counter keyed by day instead of month. It shows the engine is extensible and interacts with the plans the same way (every rule of both plans must pass). Decision: implement **only** after every core phase in §18 is done and tested; otherwise document it as a designed-but-not-built extension.
+`daily_allowance` — fits the same model: a counter keyed by day instead of month. It shows the engine is extensible and interacts with the plans the same way (every rule of both plans must pass). **Not built.** It was planned only after every core phase was done; the time went into the performance work instead. It is a designed-but-not-built extension.
 
 ---
 
@@ -301,14 +302,15 @@ Content-Type: application/json
 ```
 
 ```jsonc
-// 200 OK — accepted
+// 200 OK — accepted (used/remaining are after this request)
 {
   "requestId": "doc-8f2a-processing",
   "decision": "accepted",
   "units": 10,
   "month": "2026-10",
-  "account": { "planId": "…", "planName": "Starter", "monthlyAllowance": 10000, "used": 4210, "remaining": 5790, "maxUnitsPerRequest": 100 },
-  "user":    { "planId": "…", "planName": "Basic",   "monthlyAllowance": 1000,  "used": 310,  "remaining": 690,  "maxUnitsPerRequest": 20 },
+  "violations": [],
+  "account": { "planId": "…", "planName": "Starter", "planVersion": 1, "monthlyAllowance": 10000, "maxUnitsPerRequest": 100, "used": 4210, "remaining": 5790 },
+  "user":    { "planId": "…", "planName": "Basic",   "planVersion": 1, "monthlyAllowance": 1000,  "maxUnitsPerRequest": 20,  "used": 310,  "remaining": 690 },
   "replayed": false
 }
 
@@ -316,13 +318,17 @@ Content-Type: application/json
 {
   "requestId": "doc-9c11",
   "decision": "rejected",
-  "reason": { "scope": "account", "rule": "monthly_allowance", "limit": 10000, "message": "Account monthly allowance exceeded: 9995 used + 10 requested > 10000" },
-  "violations": [ /* all failing rules, same shape */ ],
-  "account": { …, "remaining": 5 },
-  "user":    { …, "remaining": 690 },
+  "units": 10,
+  "month": "2026-10",
+  "reason": { "scope": "account", "rule": "monthly_allowance", "limit": 10000, "actual": 10005, "message": "Account monthly allowance exceeded: 9995 used + 10 requested > 10000" },
+  "violations": [ /* all failing rules, same shape; reason is the first */ ],
+  "account": { …, "used": 9995, "remaining": 5 },
+  "user":    { …, "used": 310, "remaining": 690 },
   "replayed": false
 }
 ```
+
+`monthlyAllowance`, `maxUnitsPerRequest` and `remaining` are `null` when that rule is missing (no limit). `docs/api-examples.sh` checks real responses of this shape.
 
 **Why 200 for rejections:** the request was processed and recorded successfully; the _decision_ is data. It keeps retry logic trivial for callers (4xx/5xx = "something is wrong with the call", 200 = "here is your answer"), and a stored rejection is replayable like an acceptance. `429` was considered and rejected: it implies "retry later", which is wrong for a per-request-limit rejection.
 
@@ -347,6 +353,7 @@ sequenceDiagram
     end
     A->>A: evaluate stateless rules (max per request)
     alt violated
+        A->>P: SELECT both counters, no lock (display only)
         A->>P: INSERT ledger (rejected)
         A->>P: COMMIT
         A-->>C: 200 rejected
@@ -380,7 +387,7 @@ sequenceDiagram
 - **Rejections on per-request limits take no counter locks** → a misbehaving client spamming oversized requests can't slow down everyone else on the account. To fill `used`/`remaining` in the response, such a rejection reads both counters with a plain `SELECT` (no lock). That read is **for display only**: the decision depends only on `units` and the per-request limits, so a concurrent increment that the read misses cannot make the decision wrong. The shown numbers may be a few milliseconds stale.
 - **Rejections on monthly limits** do take the locks briefly (they had to read the counter), but write nothing to counters.
 - **Why not `SERIALIZABLE`?** It would also be correct, but under contention it aborts transactions (serialization failures) that we'd have to retry in a loop, wasting work exactly when load is highest. Pessimistic row locks give the same guarantee with queueing instead of retry storms.
-- **Why not a conditional `UPDATE … WHERE used + $u <= limit` without a lock?** It's correct for one level, but we need _both_ levels to pass atomically _and_ to explain which rule failed. With two conditional updates we'd have to roll back the first when the second fails — the transaction does that, so it's an optimization of the same design, kept for the performance phase (§11).
+- **Why not a conditional `UPDATE … WHERE used + $u <= limit` without a lock?** It's correct for one level, but we need _both_ levels to pass atomically _and_ to explain which rule failed. With two conditional updates we'd have to roll back the first when the second fails — the transaction does that, so it's an optimization of the same design. Not pursued: Phase 6b cut the locked section to 3 round trips instead, and measured that the remaining hold time is mostly round trips and the commit, not the check (`docs/performance.md`).
 
 ### 6.4 Idempotency (retries)
 
@@ -444,8 +451,8 @@ All routes under `/v1`, JSON, errors as `application/problem+json`:
 | `POST /v1/admin/accounts`                             | admin | Create account `{name, planId?}` → `{account, apiKey}` (default Starter; predefined account plans only, §7) |
 | `GET /v1/account`                                     | key   | Account info + current plan + current-month usage                                   |
 | `PUT /v1/account/plan`                                | key   | Assign account plan `{planId}`                                                      |
-| `POST /v1/account/api-keys` / `DELETE …/:id`          | key   | Rotate keys (optional)                                                              |
-| `GET /v1/plans?scope=`                                | key   | Predefined + own custom plans                                                       |
+| `POST /v1/account/api-keys` / `DELETE …/:id`          | key   | Rotate keys. **Not built** (§7); keys are revoked in the database.                 |
+| `GET /v1/plans?scope=`                                | key   | Predefined + own custom plans → `{ plans }`                                         |
 | `POST /v1/plans`                                      | key   | Create custom plan `{name, scope, rules: {monthlyAllowance?, maxUnitsPerRequest?}}` |
 | `GET /v1/plans/:planId`                               | key   | Plan + rules + version + how many users/accounts use it                             |
 | `PATCH /v1/plans/:planId`                             | key   | Update name/rules of a custom plan → version+1. `null` removes a rule. No `DELETE` (§16.13). |
@@ -488,7 +495,7 @@ Every error is `application/problem+json` as shown above, with a stable `code` t
 | `SERVICE_UNAVAILABLE`    | 503    | Database unreachable, on any route: connection refused/reset, pool connect timeout, SQLSTATE class `08`, `57P01`–`57P03` (§10). Also "not migrated" on `/health/ready`. Retrying with the same `requestId` is safe (§10). |
 | `SERVICE_BUSY`           | 503    | Consume hit `lock_timeout` (2 s) or `statement_timeout` (5 s) under contention, or a deadlock twice. Nothing was committed: retry with the same `requestId`. |
 
-All codes in use are listed above; later phases add new ones here.
+These are all the codes the code raises (checked in Phase 7 against every `AppError` in `api/src`).
 
 ### 8.2 Users: `externalId` and pagination
 
@@ -593,6 +600,8 @@ Seeding uses fixed UUIDs + `INSERT … ON CONFLICT DO NOTHING`, so restarts are 
 
 The **account counter row**. All consumes for one account serialize on it, so per-account throughput ≈ `1 / (time the lock is held)`. Throughput across _different_ accounts scales with CPU/connections. Everything we optimize is "hold the lock for less time / fewer round trips while holding it".
 
+_Measured (`docs/performance.md`):_ the first part held at every step (hot-account ≈ 0.87 × 1 / lock hold). The second part was refined: across many accounts the limit above ~20 connections is the API's single Node thread, not connections.
+
 ### 11.2 Scenarios (k6, committed in `load/`)
 
 | Scenario      | Shape                                                                         | What it proves                                                  |
@@ -614,16 +623,16 @@ After every run a **verification script** (`load/verify.sql`) checks over the wh
 
 1. **Baseline:** straightforward multi-statement transaction. Measured in Phase 3b: 10 round trips per consume (the API-key lookup, then `BEGIN`, timeouts, idempotency lookup, user + plans, account lock, user lock, two increments, ledger insert, `COMMIT`); 5 of them while holding the account row lock. Numbers: `docs/performance.md`.
 2. **API-key cache:** in-process LRU (30s TTL) → removes 1 query per request. _Measured in Phase 6b and not kept: no gain, and it would let a revoked key work for up to 30 s._
-3. **Fewer round trips:** user + both plans' rules in one query; counter upsert+lock merged (`INSERT … ON CONFLICT DO UPDATE … RETURNING`).
-4. **Stateless pre-check before locks** (already in design; measure the gain on the oversized-request mix).
-5. **Single round trip:** move the locked section into one SQL statement (data-modifying CTE) or a PL/pgSQL function → the lock is held for ~one network round trip less. Compare honestly; keep it only if the gain justifies moving logic into SQL.
+3. **Fewer round trips:** user + both plans' rules in one query; counter upsert+lock merged (`INSERT … ON CONFLICT DO UPDATE … RETURNING`). _Done in Phase 6b, steps 1–2: 10 → 6 round trips per consume, 5 → 3 under the lock. hot-account +30 %, spread +14 % (interleaved A/B against the 6a code); retry-storm −9 % (replays now pay for the merged lookup)._
+4. **Stateless pre-check before locks** (already in design; measure the gain on the oversized-request mix). _Shown in plan-flip: rejected requests never take the lock (lock statement calls = accepted requests). Not measured as a separate before/after._
+5. **Single round trip:** move the locked section into one SQL statement (data-modifying CTE) or a PL/pgSQL function → the lock is held for ~one network round trip less. Compare honestly; keep it only if the gain justifies moving logic into SQL. _Measured in Phase 6b as a prototype: +73 % on one hot account. Not kept: it needs the monthly rules written a second time, in SQL._
 6. **Pool size tuning:** sweep `max` (5/10/20/50) and show where more connections stop helping (contention, not connections, is the limit). _Done in Phase 6b (10/20/40/60): one hot account is flat at every size, and only its tail latency grows; many accounts gain up to ~40, then the API's single thread is the limit. Default kept at 20._
 
-Results table per iteration: RPS, p50/p95/p99, error rate, invariant check ✅/❌, plus a short "what we learned".
+Results table per iteration: RPS, p50/p95/p99, error rate, invariant check passed/failed, plus a short "what we learned".
 
 ### 11.4 Known scaling limits (for the README)
 
-- One hot account is bounded by single-row lock throughput (thousands/s, not millions). The real-world fix is **pre-allocating quota slices** to users/instances or sharded counters — out of scope and explained, not built.
+- One hot account is bounded by single-row lock throughput: about 330 requests/s on the test laptop (hold time ~2.6 ms; ~1.7 ms is the floor even in one round trip, because the commit's WAL flush happens while the lock is held). The real-world fix is **pre-allocating quota slices** to users/instances or sharded counters — out of scope and explained, not built.
 - Ledger grows forever → monthly partitioning of `usage_requests` is the next step.
 
 ### 11.5 Evidence: the counter row lock is load-bearing
@@ -634,7 +643,7 @@ Recorded in Phase 3b as a mutation check on the concurrency test "allowance 100,
 
 ## 12. Observability
 
-- **Logs (pino, JSON):** one line per request: `reqId`, `accountId`, route, status, latency. Consume adds `decision`, `rejectScope`, `rejectRule`, `replayed`. API keys are redacted.
+- **Logs (pino, JSON):** one line per request: `reqId`, `accountId`, method and URL, status, latency. Consume adds `decision`, `rejectScope`, `rejectRule`, `replayed`. `X-API-Key`, `X-Admin-Key`, `Authorization` and cookies are redacted (`[REDACTED]`; checked in Phase 7: no key in the logs of a full `docs/api-examples.sh` run).
 - **Metrics** (`GET /metrics`, prom-client, no auth like `/health`; one registry per process, `src/metrics.ts`):
   - `http_request_duration_seconds{route,method,status}`: `route` is the pattern (`/v1/users/:externalId/limits`), never the raw path, so user ids don't create series. Requests that match no route (unknown paths, 401 from the `/v1` key guard) are `route="unmatched"`.
   - `consume_decisions_total{decision,scope,rule}`: new decisions only; `scope`/`rule` are `none` when accepted. `consume_replays_total`, `consume_idempotency_conflicts_total`.
@@ -652,8 +661,9 @@ Recorded in Phase 3b as a mutation check on the concurrency test "allowance 100,
 | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------- |
 | Unit                        | Rules engine: every brief example (25 → user per-request; 10 → accepted; account has 5 left → account monthly), order of violations, `remaining` clamps at 0, missing rule = unlimited                                                                                                                                                              | Vitest, pure functions                 |
 | Integration (real Postgres) | Every endpoint happy path + errors; **auth:** missing/invalid/revoked key; **isolation:** A cannot see/consume/assign B's users and plans; plan update affects all assigned users; plan switch preserves usage; allowance lowered below usage → remaining 0 + rejections; month boundary (by inserting a past-month counter/ledger and querying it) | Vitest + supertest                     |
-| Concurrency                 | 200 parallel consumes vs allowance → exact accept count; account = Σ users; 50 parallel identical `requestId` → 1 row, 1 increment; payload mismatch → 409; 40 consumes while the user's plan flips `maxUnitsPerRequest` 10 ↔ 30 → every accepted row within the limits of the plan version it records; 5 accounts × 20 in parallel → exact per-account totals, no cross-account rows. Run 20× in a row before merging. | Vitest + `Promise.all` against real DB |
+| Concurrency                 | 50 parallel requests of 5 against an allowance of 100 → exactly 20 accepted, `used == 100`, account = Σ users; 30 parallel identical `requestId` (accepted, and oversized-rejected) → 1 row, 1 increment; one user against both limits → neither over-granted; 40 consumes while the user's plan flips `maxUnitsPerRequest` 10 ↔ 30 → every accepted row within the limits of the plan version it records; 5 accounts × 20 in parallel → exact per-account totals, no cross-account rows; lock order inside the one-statement lock (account before user). Run 20× in a row before merging in Phase 4. | Vitest + `Promise.all` against real DB |
 | Load                        | §11                                                                                                                                                                                                                                                                                                                                                 | k6                                     |
+| API examples                | Every curl example in the README, in order, against a running stack: status codes and key fields (`docs/api-examples.sh`, Phase 7)                                                                                                                                                                                                                 | bash + curl + jq                       |
 | Demo smoke                  | Guided scenario end-to-end in compose: all six outcomes, retry → `replayed: true`, no `mk_` key in any response to the browser (§14)                                                                                                                                                                                                              | `demo-app/scripts/smoke.ts`, CI job `demo` |
 
 Each test file uses a fresh account (new UUIDs), so tests can run in parallel without truncating tables.
@@ -670,12 +680,12 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 - **Demo server endpoints (for the page):** `GET /api/state` (account plan + used/remaining, each user's `GET /v1/users/:id/limits`, the last 10 of `GET /v1/requests`, user plans, Demo Team's rules); `POST /api/process {user, units}` (new `requestId` = UUID, returns `{request, response}`); `POST /api/retry {requestId, user, units}` (same id again → `replayed: true`); `POST /api/config/plan-limits` (`PATCH` Demo Team) and `POST /api/config/user-plan` (`PUT` a user's plan); `POST /api/scenario`. An API error keeps its status and comes back as `{error: {code, title, detail, errors, source: "metering-api"}, request, response}`. The demo's own errors have `source: "demo"`.
 - **UI, in this order:** the guided scenario; then free play: the shared-account card (the one place for account usage), one card per user (name, plan with its per-request max, one bar for the user's own allowance, units input, "Process document"; after the first request, the decision and "Retry last request"), a config panel (change a user's plan, change Demo Team's limits) and a recent-requests table; last, a collapsed "How this demo works" with the key explanation. **The decision is the most visible thing:** a large ACCEPTED / REJECTED with the units, for rejections a USER LIMIT / ACCOUNT LIMIT badge and one plain sentence (e.g. "carol has 1,000 left, but the shared account has only 5"), then "remaining: user X · account Y". Neutral light background (dark via `prefers-color-scheme`), one accent color for actions, green/red only for accepted/rejected. API errors are a visible banner with status, code and source. Works at phone width.
 - **Guided scenario button.** It runs on a **fresh account** each time (created with the admin key, with its own Demo Team plan and users), so free play can't change its result:
-  1. alice processes 10 → ✅ accepted
-  2. alice processes 25 → ❌ rejected by **user** `max_units_per_request` (Basic = 20)
-  3. bob (Premium) processes 45 → ✅ ; account now has 5 left
-  4. carol processes 10 → ❌ rejected by **account** `monthly_allowance` (carol herself has plenty)
+  1. alice processes 10 → accepted
+  2. alice processes 25 → rejected by **user** `max_units_per_request` (Basic = 20)
+  3. bob (Premium) processes 45 → accepted; account now has 5 left
+  4. carol processes 10 → rejected by **account** `monthly_allowance` (carol herself has plenty)
   5. **Change configuration only** (no client code change): `PATCH` the account plan to monthly 200, and `PUT` alice → Premium
-  6. carol 10 → ✅ ; alice 25 → ✅ — same client code, different outcome.
+  6. carol 10 → accepted; alice 25 → accepted — same client code, different outcome.
 - Each step shows a one-line explanation, the decision in the same form as free play (verdict, badge, sentence, remaining), the expected outcome with a pass/fail mark, and the raw request/response JSON (collapsible), so the reviewer sees the API, not just a pretty UI. Each run leaves one `Scenario <timestamp>` account behind (accounts are not deleted, §16).
 - **Smoke test:** `demo-app/scripts/smoke.ts` (`npm run smoke`) runs `/api/scenario` against a running stack. It checks all six outcomes from the raw API responses, a process + retry (`replayed: true`), an API error passed through (404), and that no response the page receives contains `mk_`. CI job `demo`: `docker compose up --build -d --wait`, then the smoke test.
 - **Compose:** `api` has a healthcheck (`node -e` + `fetch` on `/health/ready`; the image has no curl). `demo` depends on `api: service_healthy` and gets the same `ADMIN_API_KEY` through one YAML anchor.
@@ -686,31 +696,34 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 
 ```
 .
-├── docker-compose.yml          # db, api, demo; profiles: test (db-test), loadtest (k6)
-├── README.md                   # setup, API examples, assumptions, decisions, limitations
+├── docker-compose.yml          # db, api, demo; profiles: test (db-test), loadtest (k6, load-setup)
+├── README.md                   # setup, API reference with examples, assumptions, decisions, limitations
 ├── DESIGN.md                   # this document
+├── .env.example                # ADMIN_API_KEY, LOG_LEVEL, DB_POOL_MAX, DATABASE_URL, PORT
 ├── api/
 │   ├── Dockerfile
 │   ├── src/
-│   │   ├── server.ts / app.ts / config.ts / metrics.ts
-│   │   ├── http/{middleware/{auth.ts, validate.ts, errors.ts}, routes/*.ts, schemas/*.ts, views.ts}
+│   │   ├── server.ts / app.ts / config.ts / logger.ts / metrics.ts
+│   │   ├── http/{middleware/{auth.ts, validate.ts, errors.ts, requestLogger.ts, httpMetrics.ts}, routes/*.ts, schemas/*.ts, views.ts, cursor.ts}
 │   │   ├── services/{consume.ts, plans.ts, users.ts, usage.ts, accounts.ts}
 │   │   ├── domain/{rules.ts, month.ts, errors.ts, apiKeys.ts}
 │   │   ├── repositories/{plans.ts, users.ts, usage.ts, requests.ts, accounts.ts, apiKeys.ts}
-│   │   └── db/{pool.ts, tx.ts, migrate.ts, seed.ts, migrations/001_init.sql}
-│   └── test/{unit, integration, concurrency}
+│   │   └── db/{pool.ts, tx.ts, errors.ts, migrate.ts, seed.ts, migrations/{001_init.sql, 002_users_list_index.sql}}
+│   └── test/{unit, integration, concurrency}, helpers.ts, invariants.ts
 ├── demo-app/
 │   ├── Dockerfile
 │   ├── src/{server.ts, bootstrap.ts, provision.ts, scenario.ts, documents.ts, metering.ts, config.ts}
 │   ├── public/{index.html, style.css, app.js}
 │   └── scripts/smoke.ts
 ├── load/{setup.ts, scenarios/*.js, lib/common.js, verify.sql, run.sh, run-all.sh, report.ts, results/}
-└── docs/{performance.md, api-examples.http}
+└── docs/{performance.md, api-examples.sh}
 ```
 
 ---
 
-## 16. Product Assumptions (to copy into the README)
+## 16. Product Assumptions
+
+The README lists the same assumptions, in the same order, with the reason for each. Code comments refer to them by number (§16.4, §16.5, §16.9, §16.15), so new ones are added at the end.
 
 1. **Accounts are created by an operator** using `ADMIN_API_KEY`; there is no public signup (out of scope: end-user login).
 2. **Users must be registered** before consuming; consuming for an unknown user → 404. (Auto-registration would silently create users from typos.)
@@ -725,18 +738,26 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 11. **Plan switch mid-month** keeps consumed units; the new plan's limits are compared against the same counter.
 12. **Predefined plans are read-only** and visible to everyone; custom plans are private to their account.
 13. **Plans are never deleted**, and there is no `DELETE` endpoint. Every ledger row references the plan and version it was evaluated against (`account_plan_id`, `user_plan_id`), so deleting a plan would either break those references or force a cascade that rewrites history. Keeping plans forever also means an assignment can never race with a delete. An unused custom plan simply stays unassigned.
-14. **Users are not deleted** (history must be preserved); out of scope.
+14. **Users and accounts are not deleted** (history must be preserved); out of scope.
 15. **Past-month remaining** is reported against the currently assigned plan; the historically applied limits are in each ledger entry.
+16. **New accounts start on a predefined plan** (§7): a custom plan belongs to an account, so none can exist before the account does.
+17. **`externalId`** is 1–200 characters from `A-Z a-z 0-9 . _ : @ -`, case-sensitive (§8.2), because it appears in URLs and logs.
 
 ---
 
 ## 17. Known Limitations (honest list for the review)
 
-- Per-account throughput is capped by a single hot row (§11.4).
-- API keys can be revoked only in the database (`revoked_at`); there is no rotation or revoke endpoint (§7).
+The README has the same list in plainer words.
+
+- Per-account throughput is capped by a single hot row: about 330 requests/s for one account on the test laptop (§11.4).
+- The ledger is unpartitioned and grows forever; idempotency keys are kept forever.
+- Nothing is deleted: plans, users and accounts stay (§16.13, §16.14). The demo's guided scenario adds one `Scenario <timestamp>` account per run.
 - Requests in flight during a plan update may use the previous version (§6.5) — recorded, not hidden.
-- Ledger is unpartitioned; idempotency keys are kept forever.
 - No rate limiting of the API itself (different from quota), no RBAC, no billing.
+- API keys can be revoked only in the database (`revoked_at`); there is no rotation or revoke endpoint (§7).
+- Performance numbers come from one laptop with k6 on the same host, and vary 10–15 % between sessions (`docs/performance.md`).
+- Replays (retry-storm) got 9 % slower in Phase 6b, because the merged lookup costs more planning in Postgres. Named prepared statements are the likely fix; not built.
+- `daily_allowance` (§5.1) and key rotation (§7) are designed but not built.
 
 ---
 
@@ -751,9 +772,9 @@ Phases run in this order; each one is finished when its check passes.
 | 3     | Users, rules engine (unit tests), **consume** v1                                   | Brief's 3 examples pass as integration tests               |
 | 4     | Idempotency + concurrency tests, usage & history endpoints with pagination         | Concurrency suite green 20× in a row                       |
 | 5     | Demo app + guided scenario in compose                                              | Fresh clone → `docker compose up --build` → scenario works |
-| 6     | k6 scenarios, verify.sql, baseline numbers, optimizations §11.3                    | `docs/performance.md` with before/after table              |
-| 7     | README (API examples, assumptions, decisions, limitations), error polish           | Someone else could run everything from README alone        |
-| 8     | Optional `daily_allowance` rule                                                    | Only if phases 1–7 are done                                |
+| 6     | k6 scenarios, verify.sql, baseline numbers (6a); optimizations §11.3 (6b)          | `docs/performance.md` with before/after table              |
+| 7     | README (API examples, assumptions, decisions, limitations), docs consistency pass  | Someone else could run everything from README alone; `docs/api-examples.sh` passes |
+| 8     | Optional `daily_allowance` rule — **not built**                                    | Only if phases 1–7 are done                                |
 | 9     | Final clean-clone run, rehearse tracing a consume request through the code         | Can explain every line of `services/consume.ts`            |
 
 **Rule:** the core (consume correctness + idempotency + isolation + compose) is finished and tested before _anything_ optional is touched.
