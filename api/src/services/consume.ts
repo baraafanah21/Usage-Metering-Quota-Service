@@ -26,11 +26,11 @@ import {
 } from "../metrics.js";
 import {
   findRequest,
-  insertRequest,
+  recordDecision,
   LEDGER_REQUEST_UNIQUE,
   type StoredRequest,
 } from "../repositories/requests.js";
-import { incrementCounters, lockAccountCounter, lockUserCounter, readCounters } from "../repositories/usage.js";
+import { lockCounters, readCounters } from "../repositories/usage.js";
 import { findUserWithPlans, type UserWithPlans } from "../repositories/users.js";
 import { type LevelLimits, levelLimits, userNotFound } from "./users.js";
 
@@ -157,12 +157,12 @@ async function decide(
     return record(client, accountId, input, found, stateless, used);
   }
 
-  // 4. Lock the account counter row, then the user's. The account row is the one that
-  //    serializes competing requests (§6.3), and the fixed order means no two consumes can
-  //    ever wait on each other in a cycle. Each statement also creates the month's row.
-  const accountUsed = await lockAccountCounter(accountId, found.month, client);
+  // 4. Lock the account counter row, then the user's, in one statement. The account row is
+  //    the one that serializes competing requests (§6.3), and the fixed order means no two
+  //    consumes can ever wait on each other in a cycle. It also creates the month's rows.
+  //    From here to COMMIT the account row is locked: 3 round trips (this, record, COMMIT).
+  const { accountUsed, userUsed } = await lockCounters(accountId, found.user.id, found.month, client);
   onLocked();
-  const userUsed = await lockUserCounter(accountId, found.user.id, found.month, client);
 
   // 5. Evaluate every rule against counters nobody else can change until we commit.
   const evaluation = evaluate({
@@ -171,13 +171,9 @@ async function decide(
     user: { rules: userRules, used: userUsed },
   });
 
-  // 6. Accepted: add the units at both levels, or at neither (no partial acceptance).
-  if (evaluation.decision === "accepted") {
-    await incrementCounters(accountId, found.user.id, found.month, input.units, client);
-  }
+  // 6-8. Record the decision and, if accepted, add the units at both levels, or at neither
+  //    (no partial acceptance), in one statement; withTransaction commits when this returns.
   const delta = evaluation.decision === "accepted" ? input.units : 0;
-
-  // 7-8. Record the decision; withTransaction commits when this returns.
   return record(client, accountId, input, found, evaluation, {
     accountUsed: accountUsed + delta,
     userUsed: userUsed + delta,
@@ -186,7 +182,8 @@ async function decide(
 
 /**
  * Builds the response and appends it to the ledger with the plan versions it was evaluated
- * against. The stored body is the replay, so history survives later plan edits (§6.4).
+ * against; an accepted decision's units go to both counters in the same statement. The stored
+ * body is the replay, so history survives later plan edits (§6.4).
  */
 async function record(
   client: PoolClient,
@@ -208,7 +205,7 @@ async function record(
     replayed: false,
   };
 
-  await insertRequest(
+  await recordDecision(
     accountId,
     {
       userId: found.user.id,

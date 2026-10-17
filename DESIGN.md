@@ -351,13 +351,9 @@ sequenceDiagram
         A->>P: COMMIT
         A-->>C: 200 rejected
     end
-    A->>P: upsert+lock account counter row (FOR UPDATE)
-    A->>P: upsert+lock user counter row (FOR UPDATE)
+    A->>P: upsert+lock account counter row, then user counter row (1 statement)
     A->>A: evaluate monthly rules
-    alt accepted
-        A->>P: UPDATE both counters (+units)
-    end
-    A->>P: INSERT ledger row
+    A->>P: INSERT ledger row + UPDATE both counters if accepted (1 statement)
     A->>P: COMMIT
     A-->>C: 200 decision
 ```
@@ -365,13 +361,22 @@ sequenceDiagram
 ### 6.3 Locking — why it's correct
 
 - **Isolation level: `READ COMMITTED`** + explicit row locks. Every check that matters (monthly allowance) reads a counter row **after locking it**, so it sees the latest committed value. Two concurrent requests for the same account serialize on the account row; the second one sees the first one's increment. This is exactly the race the brief is testing.
-- **Lock acquisition** in one statement, which also creates the row on first use of the month:
+- **Lock acquisition**: both counter rows in one statement, which also creates them on first use of the month (`lockCounters`, `repositories/usage.ts`):
   ```sql
-  INSERT INTO account_monthly_usage (account_id, month, used) VALUES ($1, $2, 0)
-  ON CONFLICT (account_id, month) DO UPDATE SET used = account_monthly_usage.used
-  RETURNING used;      -- row is now locked until COMMIT
+  WITH account_row AS (
+    INSERT INTO account_monthly_usage (account_id, month, used) VALUES ($1, $3, 0)
+    ON CONFLICT (account_id, month) DO UPDATE SET used = account_monthly_usage.used
+    RETURNING used                                    -- account row locked until COMMIT
+  ), user_row AS (
+    INSERT INTO user_monthly_usage (user_id, account_id, month, used)
+    SELECT $2, $1, $3, 0 FROM account_row             -- needs account_row's row first
+    ON CONFLICT (user_id, month) DO UPDATE SET used = user_monthly_usage.used
+    RETURNING used                                    -- user row locked until COMMIT
+  )
+  SELECT account_row.used, user_row.used FROM account_row, user_row;
   ```
-- **Fixed lock order: account row, then user row.** Every transaction follows it → no deadlock cycles possible.
+- **Fixed lock order: account row, then user row.** Every transaction follows it → no deadlock cycles possible. Inside the statement above, the sub-statements of a `WITH` have no guaranteed order, so the order is forced by data: the user `INSERT` reads its row from `account_row`, which exists only once the account row is locked. `test/concurrency/lockOrder.test.ts` blocks the user row from outside and checks that the waiting statement already holds the account row.
+- **Recording** (`recordDecision`, `repositories/requests.ts`): the ledger `INSERT` and, for an accepted decision, both counter increments are one statement (data-modifying CTEs), so the ledger and both counters change together or not at all. From the lock to `COMMIT` that is 3 round trips: lock both, record, `COMMIT` (Phase 6b, `docs/performance.md`).
 - **Rejections on per-request limits take no counter locks** → a misbehaving client spamming oversized requests can't slow down everyone else on the account. To fill `used`/`remaining` in the response, such a rejection reads both counters with a plain `SELECT` (no lock). That read is **for display only**: the decision depends only on `units` and the per-request limits, so a concurrent increment that the read misses cannot make the decision wrong. The shown numbers may be a few milliseconds stale.
 - **Rejections on monthly limits** do take the locks briefly (they had to read the counter), but write nothing to counters.
 - **Why not `SERIALIZABLE`?** It would also be correct, but under contention it aborts transactions (serialization failures) that we'd have to retry in a loop, wasting work exactly when load is highest. Pessimistic row locks give the same guarantee with queueing instead of retry storms.

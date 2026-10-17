@@ -149,7 +149,16 @@ Method, for every step: change one thing, run the full API test suite, then run 
 | Step | Change | hot-account req/s | spread req/s | exhaust req/s | Lock hold ms (hot-account) | Tx mean ms (hot-account / spread) | Result |
 | --- | --- | --: | --: | --: | --: | --: | --- |
 | 0 | Measure only: add `consume_lock_hold_seconds` | 279 | 1,845 | 286 | 3.18 | 71.2 / 9.9 | reference |
+| 1 | Lock both counter rows in one statement; increments + ledger insert in one statement | 375 | 1,982 | 350 | 2.32 | 53.1 / 9.1 | **kept** |
 
 ### Step 0: measure lock hold directly
 
 6a could only derive the lock hold time as 1 / (hot-account req/s). Step 0 adds `consume_lock_hold_seconds` (and a scenario list for `run-all.sh`) without touching the consume logic, then re-measures. The measured 3.18 ms on hot-account matches 6a's estimate (≈ 3.1 ms; 1 / 279 req/s = 3.6 ms today). In spread the lock is uncontended but held longer, 5.5 ms, because the API is busier between statements (see 6a: ~1 ms per round trip there). Results: [`load/results/step-0/`](../load/results/step-0/).
+
+### Step 1: fewer round trips while holding the account lock
+
+**Change.** `lockCounters` locks the account row, then the user row, in one statement (two data-modifying CTEs, where the user `INSERT` selects from the account one, so the account row is always locked first; `test/concurrency/lockOrder.test.ts` proves it, and fails if the order is flipped). `recordDecision` adds the units to both counters and appends the ledger row in one statement. The rules engine is unchanged and stays in TypeScript. Under the lock: **5 round trips → 3** (lock both, record, `COMMIT`); per request: 10 → 8.
+
+**Why it should help.** 6a found ~87 % of the 3.1 ms lock hold was round trips, and per-account throughput ≈ 1 / hold.
+
+**What happened.** Lock hold 3.18 → **2.32 ms** (−27 %); hot-account 279 → **375 req/s** (+34 %), exhaust 286 → 350 (+22 %); spread +7 % (two fewer round trips per connection-hold). 1 / 375 req/s = 2.67 ms against 2.32 ms measured: the model holds, with the metric reading ~0.3 ms low as expected. `pg_stat_statements`: the locked section's SQL is now 0.20 ms (record) after the lock statement. exhaust accepted exactly 10,000 in all 3 runs. Results: [`load/results/step-1/`](../load/results/step-1/).

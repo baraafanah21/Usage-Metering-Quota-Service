@@ -1,0 +1,49 @@
+{
+  "scenario": "spread",
+  "cpuCores": {
+    "db": 3.26,
+    "api": 1.11,
+    "overSeconds": 61
+  },
+  "poolSamples": 119,
+  "dbPoolTotalMax": 20,
+  "dbPoolWaiting": {
+    "mean": 76.5,
+    "median": 79,
+    "max": 80
+  },
+  "consumeTxDuration": {
+    "count": 118955,
+    "meanMs": 9.14,
+    "p50Ms": 8.4,
+    "p95Ms": 22.29,
+    "p99Ms": 24.56
+  },
+  "consumePoolAcquire": {
+    "count": 118955,
+    "meanMs": 19.23,
+    "p50Ms": 17.89,
+    "p95Ms": 25.07,
+    "p99Ms": 45.07
+  },
+  "consumeLockHold": {
+    "count": 118955,
+    "meanMs": 4.28,
+    "p50Ms": 4.02,
+    "p95Ms": 8.78,
+    "p99Ms": 9.84
+  },
+  "httpConsume200": {
+    "count": 118955,
+    "meanMs": 49.01,
+    "p50Ms": 43.79,
+    "p95Ms": 92.55,
+    "p99Ms": 98.52
+  },
+  "decisions": {
+    "accepted": 118955,
+    "rejected": 0,
+    "replays": 0,
+    "idempotencyConflicts": 0
+  }
+}
