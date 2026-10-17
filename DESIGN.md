@@ -334,7 +334,8 @@ sequenceDiagram
     participant A as API
     participant P as Postgres
     C->>A: POST /v1/consume (X-API-Key, userId, units, requestId)
-    A->>A: validate body, resolve key → accountId (LRU cache, 30s TTL)
+    A->>P: resolve key → accountId (1 query; no cache, §7)
+    A->>A: validate body
     A->>P: BEGIN + SET LOCAL lock_timeout, statement_timeout (1 round trip)
     A->>P: SELECT ledger row for (account_id, request_id) + user + user plan rules + account plan rules (1 query)
     alt already exists
@@ -412,7 +413,7 @@ Plans and assignments are read **inside** the consume transaction, with no cache
 | **Account**  | `X-API-Key: mk_<base62 32 bytes>`        | Everything about _its own_ account, plans, users, usage, history. |
 
 - **API key lifecycle:** generated with `crypto.randomBytes(32)`; shown **once** in the creation response; only `sha256` stored. Optional rotation (`POST /v1/account/api-keys`, `DELETE /v1/account/api-keys/:id`) is not built. Today a key is revoked by setting `api_keys.revoked_at` in the database.
-- **API key cache** (`src/http/apiKeyCache.ts`, Phase 6b): an in-process LRU from key hash to account id, at most 10,000 entries, each trusted for `API_KEY_CACHE_TTL_MS` (default 30 s; `0` turns it off). It saves the key lookup query on every request after the first. Only keys that were found are cached, so random keys can't fill it. **Staleness window:** a key revoked in the database keeps working on an instance that has it cached for up to the TTL, then gets `401 INVALID_API_KEY`. There is no revoke endpoint that could evict the entry, so this holds even with one instance. The test suite runs with the cache off, so a revoked key fails on the next request; `test/integration/auth.test.ts` checks the cached behaviour with a 300 ms TTL (still served right after revocation, refused once the entry expires).
+- **No API key cache.** Every request looks its key up (`SELECT … FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL`, ~0.01 ms in Postgres), so a revoked key fails on the next request. Phase 6b built an in-process LRU cache with a 30 s TTL and measured it: no throughput gain in any scenario (interleaved A/B on spread: 2,223 vs 2,204 req/s), so it was reverted, along with its staleness window (`docs/performance.md`, step 3).
 - **Enforcement point:** an Express `requireApiKey` middleware, mounted on the `/v1` router before every account route, resolves the key → `req.accountId` (typed through a `Request` declaration merge). A separate `requireAdminKey` middleware guards `/v1/admin`. Missing → `401 MISSING_API_KEY`; unknown/revoked → `401 INVALID_API_KEY` (same response timing; no hint which).
 - **Tenant scoping rule:** the account id **never comes from the URL or body**. Every repository function takes `accountId` as its first parameter and every query has `WHERE account_id = $1`. Users are addressed by `externalId`, resolved as `WHERE account_id = $1 AND external_id = $2`.
 - **Auth runs before routing.** `requireApiKey` is mounted on the whole `/v1` router, so an unknown path under `/v1` returns `401 MISSING_API_KEY` without a key, and `404 NOT_FOUND` only once a valid key is sent. Without a key, a caller can't use 404-vs-401 to discover which routes exist. `/v1/admin/*` has its own guard and its own 404, so it never falls through to the account-key guard.
@@ -612,7 +613,7 @@ After every run a **verification script** (`load/verify.sql`) checks over the wh
 ### 11.3 Iterations (measure → change one thing → re-measure → record in `docs/performance.md`)
 
 1. **Baseline:** straightforward multi-statement transaction. Measured in Phase 3b: 10 round trips per consume (the API-key lookup, then `BEGIN`, timeouts, idempotency lookup, user + plans, account lock, user lock, two increments, ledger insert, `COMMIT`); 5 of them while holding the account row lock. Numbers: `docs/performance.md`.
-2. **API-key cache:** in-process LRU (30s TTL) → removes 1 query per request.
+2. **API-key cache:** in-process LRU (30s TTL) → removes 1 query per request. _Measured in Phase 6b and not kept: no gain, and it would let a revoked key work for up to 30 s._
 3. **Fewer round trips:** user + both plans' rules in one query; counter upsert+lock merged (`INSERT … ON CONFLICT DO UPDATE … RETURNING`).
 4. **Stateless pre-check before locks** (already in design; measure the gain on the oversized-request mix).
 5. **Single round trip:** move the locked section into one SQL statement (data-modifying CTE) or a PL/pgSQL function → the lock is held for ~one network round trip less. Compare honestly; keep it only if the gain justifies moving logic into SQL.
@@ -732,7 +733,7 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 ## 17. Known Limitations (honest list for the review)
 
 - Per-account throughput is capped by a single hot row (§11.4).
-- The API key cache serves a revoked key for up to `API_KEY_CACHE_TTL_MS` (default 30 s) on every instance that has it cached, this one included, because revocation is a database update with no eviction (§7). Set the TTL to `0` where that matters more than one query per request.
+- API keys can be revoked only in the database (`revoked_at`); there is no rotation or revoke endpoint (§7).
 - Requests in flight during a plan update may use the previous version (§6.5) — recorded, not hidden.
 - Ledger is unpartitioned; idempotency keys are kept forever.
 - No rate limiting of the API itself (different from quota), no RBAC, no billing.

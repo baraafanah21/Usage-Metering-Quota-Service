@@ -1,0 +1,14 @@
+ calls  | total_ms | mean_ms | max_ms |  rows  |                                                                    query                                                                     
+--------+----------+---------+--------+--------+----------------------------------------------------------------------------------------------------------------------------------------------
+ 134989 |  21506.4 |   0.159 |   28.2 | 134989 | WITH account_row AS ( INSERT INTO account_monthly_usage (account_id, month, used) VALUES ($1, $3::date, $4) ON CONFLICT (account_id, month) 
+ 134989 |  17868.3 |   0.132 |    2.7 | 134989 | WITH account_increment AS ( UPDATE account_monthly_usage SET used = used + $4 WHERE account_id = $1 AND month = $8::date AND $5::decision = 
+ 134989 |   6456.4 |   0.048 |    3.1 | 134989 | WITH found AS MATERIALIZED ( SELECT u.id, u.external_id, u.plan_id, u.created_at, up.name AS up_name, up.version AS up_version, ur.monthly A
+ 134989 |    986.3 |   0.007 |    0.2 | 134989 | SELECT account_id FROM api_keys WHERE key_hash = $1 AND revoked_at IS NULL
+ 134989 |    369.3 |   0.003 |    0.1 |      0 | SET LOCAL lock_timeout = '2s'
+ 134989 |    106.4 |   0.001 |    0.2 |      0 | SET LOCAL statement_timeout = '5s'
+ 134989 |     52.5 |   0.000 |    0.0 |      0 | COMMIT
+ 134989 |     47.1 |   0.000 |    0.1 |      0 | BEGIN
+     29 |      0.2 |   0.009 |    0.0 |     29 | SELECT $2 FROM schema_migrations WHERE version = $1
+      1 |      0.1 |   0.074 |    0.1 |      1 | SELECT pg_stat_statements_reset()
+(10 rows)
+

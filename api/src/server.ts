@@ -34,9 +34,7 @@ async function main(): Promise<void> {
     process.exit(1);
   }
 
-  const server = createServer(
-    createApp({ pool, logger, adminApiKey: config.ADMIN_API_KEY, apiKeyCacheTtlMs: config.API_KEY_CACHE_TTL_MS }),
-  );
+  const server = createServer(createApp({ pool, logger, adminApiKey: config.ADMIN_API_KEY }));
 
   // Bound how long one request can hold a socket (DESIGN.md §10, pool exhaustion).
   server.requestTimeout = 30_000;

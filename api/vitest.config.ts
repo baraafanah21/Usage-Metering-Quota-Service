@@ -10,9 +10,6 @@ export default defineConfig({
       DATABASE_URL: TEST_DATABASE_URL,
       ADMIN_API_KEY: "test-admin-key-0123456789abcdef0123456789",
       LOG_LEVEL: "silent",
-      // No API key cache in tests: a key revoked in the database fails on the next request.
-      // test/integration/auth.test.ts checks the cached behaviour with its own short TTL.
-      API_KEY_CACHE_TTL_MS: "0",
     },
   },
 });

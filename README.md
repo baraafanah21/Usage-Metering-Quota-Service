@@ -13,7 +13,7 @@ docker compose up --build
 curl localhost:3000/health/ready   # {"status":"ok"}
 ```
 
-This starts three services: `db`, `api` and `demo`. Open the demo at **http://localhost:8080** (see [Demo](#demo)). The API listens on `localhost:3000`. On startup it applies database migrations and seeds the predefined plans. Both steps are safe to repeat on every start. Optional settings (`ADMIN_API_KEY`, `LOG_LEVEL`, `DB_POOL_MAX`, `API_KEY_CACHE_TTL_MS`) can go in a `.env` file; see [.env.example](.env.example).
+This starts three services: `db`, `api` and `demo`. Open the demo at **http://localhost:8080** (see [Demo](#demo)). The API listens on `localhost:3000`. On startup it applies database migrations and seeds the predefined plans. Both steps are safe to repeat on every start. Optional settings (`ADMIN_API_KEY`, `LOG_LEVEL`, `DB_POOL_MAX`) can go in a `.env` file; see [.env.example](.env.example).
 
 | Endpoint                     | Auth          | Meaning                                                        |
 | ---------------------------- | ------------- | -------------------------------------------------------------- |

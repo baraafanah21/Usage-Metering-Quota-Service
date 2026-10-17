@@ -1,0 +1,49 @@
+{
+  "scenario": "hot-account",
+  "cpuCores": {
+    "db": 1.08,
+    "api": 0.48,
+    "overSeconds": 61.2
+  },
+  "poolSamples": 120,
+  "dbPoolTotalMax": 20,
+  "dbPoolWaiting": {
+    "mean": 78,
+    "median": 80,
+    "max": 81
+  },
+  "consumeTxDuration": {
+    "count": 19283,
+    "meanMs": 62.44,
+    "p50Ms": 39.91,
+    "p95Ms": 229.85,
+    "p99Ms": 403.9
+  },
+  "consumePoolAcquire": {
+    "count": 19283,
+    "meanMs": 247.23,
+    "p50Ms": 243.4,
+    "p95Ms": 473.81,
+    "p99Ms": 494.76
+  },
+  "consumeLockHold": {
+    "count": 19283,
+    "meanMs": 2.67,
+    "p50Ms": 2.89,
+    "p95Ms": 4.82,
+    "p99Ms": 4.99
+  },
+  "httpConsume200": {
+    "count": 19283,
+    "meanMs": 311.21,
+    "p50Ms": 354.64,
+    "p95Ms": 493.04,
+    "p99Ms": 817.4
+  },
+  "decisions": {
+    "accepted": 19283,
+    "rejected": 0,
+    "replays": 0,
+    "idempotencyConflicts": 0
+  }
+}

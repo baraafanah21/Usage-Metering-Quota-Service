@@ -4,7 +4,6 @@ import type { Pool } from "pg";
 import { API_KEY_PATTERN, hashApiKey } from "../../domain/apiKeys.js";
 import { AppError } from "../../domain/errors.js";
 import { findAccountIdByKeyHash } from "../../repositories/apiKeys.js";
-import type { ApiKeyCache } from "../apiKeyCache.js";
 
 declare global {
   namespace Express {
@@ -39,31 +38,22 @@ export function requireAdminKey(adminApiKey: string): RequestHandler {
   };
 }
 
-/**
- * Resolves X-API-Key to req.accountId, from the cache when it has the key (§7). Unknown and
- * revoked keys get the same answer.
- */
-export function requireApiKey(pool: Pool, cache: ApiKeyCache): RequestHandler {
+/** Resolves X-API-Key to req.accountId. Unknown and revoked keys get the same answer. */
+export function requireApiKey(pool: Pool): RequestHandler {
   return async (req, _res, next) => {
     const key = header(req, "x-api-key");
     if (!key) {
       throw new AppError(401, "MISSING_API_KEY", "Missing API key", "Send the X-API-Key header");
     }
-    const accountId = API_KEY_PATTERN.test(key) ? await resolveKey(hashApiKey(key), pool, cache) : undefined;
+    const accountId = API_KEY_PATTERN.test(key)
+      ? await findAccountIdByKeyHash(hashApiKey(key), pool)
+      : undefined;
     if (!accountId) {
       throw new AppError(401, "INVALID_API_KEY", "Invalid API key");
     }
     req.accountId = accountId;
     next();
   };
-}
-
-async function resolveKey(hash: Buffer, pool: Pool, cache: ApiKeyCache): Promise<string | undefined> {
-  const cached = cache.get(hash);
-  if (cached) return cached;
-  const accountId = await findAccountIdByKeyHash(hash, pool);
-  if (accountId) cache.set(hash, accountId);
-  return accountId;
 }
 
 /** For handlers mounted behind requireApiKey. Missing means the router is wired wrong. */

@@ -151,6 +151,7 @@ Method, for every step: change one thing, run the full API test suite, then run 
 | 0 | Measure only: add `consume_lock_hold_seconds` | 279 | 1,845 | 286 | 3.18 | 71.2 / 9.9 | reference |
 | 1 | Lock both counter rows in one statement; increments + ledger insert in one statement | 375 | 1,982 | 350 | 2.32 | 53.1 / 9.1 | **kept** |
 | 2 | `BEGIN` + `SET LOCAL` in one round trip; idempotency and user lookups in one query | 335 (A/B: 336 vs step 1 351) | 2,167 | 341 | 2.57 (A/B: 2.56 vs 2.47) | 59.4 / 8.2 | **kept** (spread +9 %; hot-account unchanged, as expected) |
+| 3 | API key cache (in-process LRU, 30 s TTL) | 320 | 2,190 (A/B: 2,204 vs step 2 2,223) | 334 | 2.67 | 62.4 / 9.1 | **reverted**: no gain |
 
 ### Step 0: measure lock hold directly
 
@@ -177,3 +178,13 @@ Method, for every step: change one thing, run the full API test suite, then run 
 **hot-account: no change, as the model predicts.** The three step-2 runs (281 / 335 / 344 req/s) looked worse than step 1, and attempt 1 had looked better (421). Neither makes sense for a change outside the lock, so I ran step 1 and step 2 interleaved on hot-account, 3 runs each: **step 1 351 req/s (lock hold 2.47 ms), step 2 336 (2.56 ms)**. That is the same within noise. The run-to-run and session-to-session swings (step 1 measured 375 earlier the same night) are as large as the effects here, which is why the final comparison is interleaved too. A/B results: [`load/results/ab-step1/`](../load/results/ab-step1/), [`load/results/ab-step2/`](../load/results/ab-step2/).
 
 **Finding that changes the 6a analysis.** During spread, the node process's main thread runs at 93–98 % of a core (`/proc/1/task/*/stat`, three 5 s windows). spread is bound by the API's single thread, not by Postgres. Removing statements helps spread mainly because every round trip costs that thread CPU (driver protocol work, promises, callbacks). The 6a sections above are corrected.
+
+### Step 3: API key cache (reverted)
+
+**Change.** An in-process LRU from key hash to account id: 10,000 entries, `API_KEY_CACHE_TTL_MS` (30 s default, 0 = off), only found keys cached. Tests ran with TTL 0, so the existing revoked-key test was unchanged. A new test showed a revoked key still served right after revocation and refused once its 300 ms entry expired. It failed when expiry was removed.
+
+**Why it should help.** One query and one pool checkout less per request, outside the lock. The expectation was a gain on spread (per-request API work) and nothing on hot-account.
+
+**What happened.** The cache worked: API key lookups fell from ~130,000 to 539 per spread run. Throughput didn't move: spread 2,190 req/s in the step-3 runs, and in an interleaved A/B, **step 2 2,223 vs step 3 2,204 req/s** (medians of 3). hot-account (320) and exhaust (334) were within noise of step 2. API CPU dropped slightly (1.11 → 1.07 cores). The mean pool acquire doubled (17 → 34 ms), but that is not a slowdown. Each request now queues for the pool once instead of twice, so the same total wait lands on one acquire. The key lookup costs Postgres 0.008 ms and the API thread very little, and neither bottleneck (the API thread for spread, the lock for hot-account) shrinks when it goes.
+
+**Decision: reverted.** No measurable gain, and the cache would let a revoked key keep working for up to 30 s. DESIGN.md §7 now says there is no cache. It had described one, with eviction on a revoke endpoint that doesn't exist. Results: [`load/results/step-3/`](../load/results/step-3/), [`ab-spread-step2/`](../load/results/ab-spread-step2/), [`ab-spread-step3/`](../load/results/ab-spread-step3/).
