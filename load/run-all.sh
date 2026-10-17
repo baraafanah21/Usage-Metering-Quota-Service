@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
 # Every scenario, N times, each run on a fresh stack (empty database), then the medians.
 #
-#   load/run-all.sh <label> [runs=3]
+#   load/run-all.sh <label> [runs=3] [scenario...]     (default: all six)
 #
 # Results: load/results/<label>/run<i>/<scenario>.*, medians in load/results/<label>/summary.{md,json}.
-# About 25 minutes for 3 runs (docs/performance.md). Keeps going after a failed run and
+# About 19 minutes for all six, 3 runs (docs/performance.md). Keeps going after a failed run and
 # exits non-zero at the end if any run failed.
 set -uo pipefail
 
 label=${1:-}
 runs=${2:-3}
+shift $(($# < 2 ? $# : 2))
+scenarios=("$@")
+((${#scenarios[@]})) || scenarios=(spread hot-account hot-user exhaust retry-storm plan-flip)
 if [[ ! "$label" =~ ^[A-Za-z0-9._-]+$ || ! "$runs" =~ ^[1-9][0-9]*$ ]]; then
-  echo "usage: load/run-all.sh <label> [runs=3]" >&2
+  echo "usage: load/run-all.sh <label> [runs=3] [scenario...]" >&2
   exit 2
 fi
 cd "$(dirname "$0")/.."
@@ -21,7 +24,7 @@ LOAD_GID=$(id -g)
 
 failed=()
 for ((i = 1; i <= runs; i++)); do
-  for scenario in spread hot-account hot-user exhaust retry-storm plan-flip; do
+  for scenario in "${scenarios[@]}"; do
     echo "######## $scenario, run $i of $runs"
     FRESH_STACK=1 load/run.sh "$scenario" "$label/run$i" || failed+=("$scenario/run$i")
   done

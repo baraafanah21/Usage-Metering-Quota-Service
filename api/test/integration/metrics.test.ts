@@ -61,6 +61,9 @@ describe("GET /metrics", () => {
     expect(delta("consume_tx_duration_seconds_count")).toBe(4);
     expect(delta("consume_pool_acquire_seconds_count")).toBe(4);
     expect(delta("consume_tx_duration_seconds_sum")).toBeGreaterThan(0);
+    // Only the accepted consume reached the counter locks: the oversized one was rejected
+    // before them, the replay and the conflict were answered from the ledger.
+    expect(delta("consume_lock_hold_seconds_count")).toBe(1);
     expect(delta("http_request_duration_seconds_count", { route: "/v1/consume", method: "POST", status: "200" })).toBe(3);
     expect(delta("http_request_duration_seconds_count", { route: "/v1/consume", method: "POST", status: "409" })).toBe(1);
   });

@@ -19,6 +19,7 @@ import {
 import {
   consumeDecisions,
   consumeIdempotencyConflicts,
+  consumeLockHold,
   consumePoolAcquire,
   consumeReplays,
   consumeTxDuration,
@@ -66,8 +67,20 @@ const TX_TIMEOUTS = "SET LOCAL lock_timeout = '2s'; SET LOCAL statement_timeout 
  */
 export async function consume(pool: Pool, accountId: string, input: ConsumeInput): Promise<ConsumeResponse> {
   for (let attempt = 1; ; attempt++) {
+    // Set by decide() once the account row is locked; the lock is held until COMMIT ends.
+    let lockedAt: number | undefined;
+    const observeTx = (timing: TxTiming) => {
+      consumePoolAcquire.observe(timing.acquire);
+      consumeTxDuration.observe(timing.tx);
+      if (lockedAt !== undefined) consumeLockHold.observe((performance.now() - lockedAt) / 1000);
+    };
     try {
-      return counted(await withTransaction(pool, (client) => decide(client, accountId, input), observeTx));
+      const response = await withTransaction(
+        pool,
+        (client) => decide(client, accountId, input, () => (lockedAt = performance.now())),
+        observeTx,
+      );
+      return counted(response);
     } catch (err) {
       // An identical request recorded its decision first and ours rolled back entirely,
       // including any counter increment. Answer with the winner's decision.
@@ -94,11 +107,6 @@ export async function consume(pool: Pool, accountId: string, input: ConsumeInput
   }
 }
 
-function observeTx(timing: TxTiming): void {
-  consumePoolAcquire.observe(timing.acquire);
-  consumeTxDuration.observe(timing.tx);
-}
-
 /** Counts a committed outcome (§12): a new decision, or a replay of a recorded one. */
 function counted(response: ConsumeResponse): ConsumeResponse {
   if (response.replayed) {
@@ -114,7 +122,12 @@ function counted(response: ConsumeResponse): ConsumeResponse {
 }
 
 /** The whole decision, inside one transaction. Throwing anywhere rolls everything back. */
-async function decide(client: PoolClient, accountId: string, input: ConsumeInput): Promise<ConsumeResponse> {
+async function decide(
+  client: PoolClient,
+  accountId: string,
+  input: ConsumeInput,
+  onLocked: () => void,
+): Promise<ConsumeResponse> {
   await client.query(TX_TIMEOUTS);
 
   // 1. Idempotency. A requestId names one decision forever: if it is already recorded,
@@ -148,6 +161,7 @@ async function decide(client: PoolClient, accountId: string, input: ConsumeInput
   //    serializes competing requests (§6.3), and the fixed order means no two consumes can
   //    ever wait on each other in a cycle. Each statement also creates the month's row.
   const accountUsed = await lockAccountCounter(accountId, found.month, client);
+  onLocked();
   const userUsed = await lockUserCounter(accountId, found.user.id, found.month, client);
 
   // 5. Evaluate every rule against counters nobody else can change until we commit.

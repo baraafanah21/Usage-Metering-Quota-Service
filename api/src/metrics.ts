@@ -44,6 +44,13 @@ export const consumeTxDuration = new Histogram({
   registers: [registry],
 });
 
+export const consumeLockHold = new Histogram({
+  name: "consume_lock_hold_seconds",
+  help: "From the account counter lock statement's response to the end of COMMIT: how long a consume held the account row",
+  buckets: LATENCY_BUCKETS,
+  registers: [registry],
+});
+
 export const consumePoolAcquire = new Histogram({
   name: "consume_pool_acquire_seconds",
   help: "Time a consume waited for a pool connection before BEGIN",

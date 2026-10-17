@@ -137,3 +137,19 @@ Each item from DESIGN.md §11.3 is one change, measured with `load/run-all.sh <l
 - Each run is 60 s (exhaust ≈ 7 s) from a cold start: JIT warm-up and an empty database are included. The ledger stays small (≤ 120,000 rows), so these numbers say nothing about a large ledger (§11.4).
 - `pg_stat_statements` and request logging at `info` are on in every run. Both cost a little, the same in Phase 6b.
 - Server-side percentiles in `.metrics.json` are interpolated inside histogram buckets and are approximate. Means (Δsum / Δcount) are exact. The k6 percentiles in the table are exact.
+
+## Phase 6b: improvements
+
+Method, for every step: change one thing, run the full API test suite, then run `load/run-all.sh step-N 3 spread hot-account exhaust` (each run on a fresh stack). Keep the change only if it helps and the code stays clear. All runs are on the machine above.
+
+**Compare each step with step 0, not with the 6a table.** Step 0 re-measured the 6a code on the day of Phase 6b, and hot-account came out at 279 req/s against 322 in the 6a baseline, with identical consume code. The laptop varies by about 10–15 % between sessions, which is as large as some of the effects measured here. Steps 0 to N were measured back to back in one session.
+
+**Lock hold** is `consume_lock_hold_seconds` (added in step 0): from the response of the statement that locks the account row to the end of `COMMIT`. It starts when that response arrives, about half a round trip after Postgres granted the lock, so it reads a little low. 1 / (hot-account req/s) is the other estimate of the same thing.
+
+| Step | Change | hot-account req/s | spread req/s | exhaust req/s | Lock hold ms (hot-account) | Tx mean ms (hot-account / spread) | Result |
+| --- | --- | --: | --: | --: | --: | --: | --- |
+| 0 | Measure only: add `consume_lock_hold_seconds` | 279 | 1,845 | 286 | 3.18 | 71.2 / 9.9 | reference |
+
+### Step 0: measure lock hold directly
+
+6a could only derive the lock hold time as 1 / (hot-account req/s). Step 0 adds `consume_lock_hold_seconds` (and a scenario list for `run-all.sh`) without touching the consume logic, then re-measures. The measured 3.18 ms on hot-account matches 6a's estimate (≈ 3.1 ms; 1 / 279 req/s = 3.6 ms today). In spread the lock is uncontended but held longer, 5.5 ms, because the API is busier between statements (see 6a: ~1 ms per round trip there). Results: [`load/results/step-0/`](../load/results/step-0/).
