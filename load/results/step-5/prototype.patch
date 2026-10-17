@@ -1,0 +1,65 @@
+--- current/api/src/services/consume.ts	2026-10-17 03:24:02.882769212 +0300
++++ prototype/api/src/services/consume.ts	2026-10-17 03:31:39.167638123 +0300
+@@ -77,6 +77,8 @@
+       if (lockedAt !== undefined) consumeLockHold.observe((performance.now() - lockedAt) / 1000);
+     };
+     try {
++      const fast = await prototypeOneRoundTrip(pool, accountId, input);
++      if (fast) return counted(fast);
+       const response = await withTransaction(
+         pool,
+         (client) => decide(client, accountId, input, () => (lockedAt = performance.now())),
+@@ -288,3 +290,53 @@
+   if (!winner) throw original; // a unique violation implies a committed row; should not happen
+   return replayOf(winner, input);
+ }
++
++/**
++ * PROTOTYPE, Phase 6b step 5 measurement only (never merged): the locked section as ONE
++ * autocommit statement (lock both rows + increment + ledger insert + implicit COMMIT), so the
++ * account row is held for one round trip. Only for plans without monthly rules (hot-account),
++ * where no locked value can change the decision; everything else takes the normal path. The
++ * real version would need the monthly rules evaluated in SQL.
++ */
++async function prototypeOneRoundTrip(pool: Pool, accountId: string, input: ConsumeInput): Promise<ConsumeResponse | undefined> {
++  const { stored, found } = await findConsumeContext(accountId, input.userId, input.requestId, pool);
++  if (stored) return replayOf(stored, input);
++  if (!found) throw userNotFound(input.userId);
++  if (found.accountPlan.rules.monthlyAllowance !== null || found.userPlan.rules.monthlyAllowance !== null) return undefined;
++  const accountRules = toRules(found.accountPlan.rules);
++  const userRules = toRules(found.userPlan.rules);
++  if (evaluateStateless({ units: input.units, account: { rules: accountRules }, user: { rules: userRules } }).decision === "rejected") {
++    return undefined;
++  }
++  // No monthly rule at either level: accepted whatever the counters say.
++  const evaluation = evaluate({ units: input.units, account: { rules: accountRules, used: 0 }, user: { rules: userRules, used: 0 } });
++  const response: ConsumeResponse = {
++    requestId: input.requestId, decision: evaluation.decision, units: input.units, month: found.month.slice(0, 7),
++    violations: evaluation.violations,
++    account: levelLimits(found.accountPlan, input.units), user: levelLimits(found.userPlan, input.units), replayed: false,
++  };
++  const { rows } = await pool.query<{ account_used: string; user_used: string }>(
++    `WITH account_row AS (
++       INSERT INTO account_monthly_usage (account_id, month, used) VALUES ($1, $3::date, $4)
++       ON CONFLICT (account_id, month) DO UPDATE SET used = account_monthly_usage.used + $4
++       RETURNING used
++     ), user_row AS (
++       INSERT INTO user_monthly_usage (user_id, account_id, month, used)
++       SELECT $2::uuid, $1::uuid, $3::date, $4 FROM account_row
++       ON CONFLICT (user_id, month) DO UPDATE SET used = user_monthly_usage.used + $4
++       RETURNING used
++     ), ledger AS (
++       INSERT INTO usage_requests
++         (account_id, user_id, request_id, units, decision, month,
++          account_plan_id, account_plan_version, user_plan_id, user_plan_version, evaluation)
++       SELECT $1, $2, $5, $4, 'accepted', $3::date, $6, $7, $8, $9, $10 FROM user_row
++       RETURNING id
++     )
++     SELECT account_row.used AS account_used, user_row.used AS user_used FROM account_row, user_row, ledger`,
++    [accountId, found.user.id, found.month, input.units, input.requestId,
++     found.accountPlan.id, found.accountPlan.version, found.userPlan.id, found.userPlan.version, JSON.stringify(response)],
++  );
++  // Lock hold is not observed here: the statement's duration includes waiting for the lock.
++  const r = rows[0]!;
++  return { ...response, account: levelLimits(found.accountPlan, Number(r.account_used)), user: levelLimits(found.userPlan, Number(r.user_used)) };
++}

@@ -153,6 +153,7 @@ Method, for every step: change one thing, run the full API test suite, then run 
 | 2 | `BEGIN` + `SET LOCAL` in one round trip; idempotency and user lookups in one query | 335 (A/B: 336 vs step 1 351) | 2,167 | 341 | 2.57 (A/B: 2.56 vs 2.47) | 59.4 / 8.2 | **kept** (spread +9 %; hot-account unchanged, as expected) |
 | 3 | API key cache (in-process LRU, 30 s TTL) | 320 | 2,190 (A/B: 2,204 vs step 2 2,223) | 334 | 2.67 | 62.4 / 9.1 | **reverted**: no gain |
 | 4 | Pool size sweep `DB_POOL_MAX` 10 / 20 / 40 / 60 | 356 / 334 / 325 / 326 | 1,701 / 2,190 / 2,361 / 2,399 | – | 2.48 / 2.58 / 2.63 / 2.64 | 27.8 / 59.6 / 122.6 / 183.3 (hot-account) | **default stays 20** |
+| 5 | Prototype: locked section as ONE autocommit statement (lock + write + commit) | 584 vs 337 (A/B) | – | – | ≈ 1.7 vs ≈ 3.0 (1 / req/s) | – | **measured, not kept** |
 
 ### Step 0: measure lock hold directly
 
@@ -206,3 +207,20 @@ Method, for every step: change one thing, run the full API test suite, then run 
 **spread: scales only partly.** 10 → 20 connections: +29 %. 20 → 40: +8 %. 40 → 60: +2 %. It stops where the API's single thread is full: the API uses 1.11–1.13 cores from 20 connections up. That fits step 2's finding. Connections are the limit below 20, and the API thread is the limit above it. So the 6a expectation ("spread scales with the pool") holds only up to ~20–40.
 
 **Default: 20 (unchanged).** 40 would buy spread +8 %, but it would cost a hot account +54 % at p99 and bring it closer to the lock timeout. It would also use 40 of Postgres's 100 connections per API instance. Since the API thread is spread's limit above 20, more instances (each with its own thread and a pool of 20) is the better way to scale than more connections per instance. No code change in this step. Results: [`load/results/step-4/`](../load/results/step-4/) (`pool-<n>/summary.md` for each size).
+
+### Step 5: the locked section in one round trip (measured, not kept)
+
+**What a real version needs.** The decision on monthly limits needs the locked counter values, and the ledger row must store the full response atomically with the increments, because replays return it. So holding the lock for one round trip means evaluating the monthly rules in SQL, a PL/pgSQL function or a CTE, including the violation order, the messages and the response JSON. That would be a second rules engine next to `src/domain/rules.ts`, which the stateless checks and the display still need.
+
+**What was measured instead: the upper bound.** Before paying that cost, a prototype (never merged; diff in [`load/results/step-5/prototype.patch`](../load/results/step-5/prototype.patch)) handled only plans **without** monthly rules, where no locked value can change the decision. Everything else took the normal path. It ran the lookup as one statement, then one **autocommit** statement: lock both rows, increment, insert the ledger row, and commit as part of the statement. That is the fewest round trips any SQL function could reach. It was interleaved with the current code on hot-account (unlimited plans, so every request took the prototype path), 3 runs each:
+
+| hot-account | req/s | p50 / p95 / p99 ms | Lock hold ≈ 1 / req/s |
+| --- | --: | --: | --: |
+| current (steps 1–2) | 337 | 276 / 438 / 549 | 2.97 ms |
+| one-round-trip prototype | **584 (+73 %)** | 158 / 249 / 310 | 1.71 ms |
+
+The 3 runs on each side varied by under 1 %, and verify.sql passed on all 6. The full API suite passed on the prototype except the metrics test, which counts one transaction per consume, while the prototype answers replays outside a transaction.
+
+**Why the hold is still ~1.7 ms with one round trip.** Postgres releases row locks only after the commit record is flushed to disk (`synchronous_commit = on`), so the WAL flush is inside the hold. That flush is the floor for a durable single hot row on this machine. Turning `synchronous_commit` off would lower the floor, but an acknowledged consume could then be lost in a crash. Not considered.
+
+**Decision.** Not kept. The gain is real and large for **one** hot account (+73 %), but it costs a second implementation of the rules in SQL with its own tests, and the risk that the two engines drift apart. For one account, sharded counters (below) remove the single-row limit altogether rather than shortening it. If one account must exceed ~350 req/s before that work, this is the next step to build, and its number is now known. Results: [`load/results/step-5/`](../load/results/step-5/).
