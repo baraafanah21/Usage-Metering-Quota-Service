@@ -73,6 +73,10 @@ jobs:
         working-directory: demo-app
         run: npm run smoke
 
+      # Every curl example in the README, with the status codes and fields it shows.
+      - name: README API examples
+        run: docs/api-examples.sh
+
       - name: Logs on failure
         if: failure()
         run: docker compose logs --no-color
