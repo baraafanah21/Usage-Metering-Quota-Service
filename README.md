@@ -2,7 +2,7 @@
 
 An HTTP service that decides, before an application processes a unit of work, whether an account and one of its users still have quota for it. Each account and each user has a plan (a monthly allowance and a per-request limit). A consume call is accepted only if both levels pass, and every decision goes into a ledger. It is built with TypeScript, Express 5 and PostgreSQL 16, and correctness under concurrency is enforced by the database. See [DESIGN.md](DESIGN.md) for the full design. It is the source of truth for this project.
 
-> Status: Phase 6a. Accounts, API keys, plans, users, effective limits, `POST /v1/consume`, monthly usage, decision history, the demo app, Prometheus metrics and the load-test harness with baseline numbers exist. Optimizations measured against that baseline come next. See [DESIGN.md §18](DESIGN.md#18-build-order).
+> Status: Phase 6b. Accounts, API keys, plans, users, effective limits, `POST /v1/consume`, monthly usage, decision history, the demo app, Prometheus metrics, the load-test harness, and the measured performance improvements exist ([docs/performance.md](docs/performance.md)). README polish comes next. See [DESIGN.md §18](DESIGN.md#18-build-order).
 
 ## Run it
 
@@ -218,6 +218,7 @@ k6 scenarios for throughput and correctness under contention ([DESIGN.md §11](D
 ```sh
 load/run.sh hot-account baseline       # one scenario: fresh accounts → k6 → verify.sql → one-line summary
 load/run-all.sh baseline 3             # every scenario 3 times, each on a fresh stack, then medians
+load/run-all.sh step-1 3 spread hot-account   # only these scenarios
 ```
 
 `run.sh` starts `db` and `api` if needed, and with `FRESH_STACK=1` first runs `docker compose down -v`, which deletes the dev database and the demo's data. Results go to `load/results/<label>/`. After every run, `load/verify.sql` checks the counters against the ledger over the whole database and fails the run if anything is off. The baseline numbers, how long each scenario takes and the bottleneck analysis are in [docs/performance.md](docs/performance.md).

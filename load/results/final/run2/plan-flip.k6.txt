@@ -1,0 +1,59 @@
+
+
+  █ THRESHOLDS 
+
+    checks
+    ✓ 'rate>0.99' rate=100.00%
+
+    http_req_duration{name:consume}
+    ✓ 'p(99)<2000' p(99)=332.46ms
+
+    http_req_failed{name:consume}
+    ✓ 'rate<0.01' rate=0.00%
+
+    http_req_failed{name:flip}
+    ✓ 'rate<0.01' rate=0.00%
+
+    http_reqs{name:consume}
+    ✓ 'count>0' count=33539
+
+    http_reqs{name:flip}
+    ✓ 'count>100' count=357
+
+
+  █ TOTAL RESULTS 
+
+    checks_total.......: 33896   563.423351/s
+    checks_succeeded...: 100.00% 33896 out of 33896
+    checks_failed......: 0.00%   0 out of 33896
+
+    ✓ consume: 200 with a decision
+    ✓ flip: 200
+
+    CUSTOM
+    consume_accepted...............: 19607  325.90989/s
+    consume_rejected...............: 13932  231.579364/s
+
+    HTTP
+    http_req_duration..............: avg=89.2ms  min=13.97ms med=70.3ms  max=724.03ms p(90)=173.73ms p(95)=221.8ms  p(99)=331.79ms
+      { expected_response:true }...: avg=89.2ms  min=13.97ms med=70.3ms  max=724.03ms p(90)=173.73ms p(95)=221.8ms  p(99)=331.79ms
+      { name:consume }.............: avg=89.43ms min=13.97ms med=70.31ms max=724.03ms p(90)=174.6ms  p(95)=222.45ms p(99)=332.46ms
+    http_req_failed................: 0.00%  0 out of 33896
+      { name:consume }.............: 0.00%  0 out of 33539
+      { name:flip }................: 0.00%  0 out of 357
+    http_reqs......................: 33896  563.423351/s
+      { name:consume }.............: 33539  557.489254/s
+      { name:flip }................: 357    5.934097/s
+
+    EXECUTION
+    iteration_duration.............: avg=90.37ms min=16.7ms  med=71.35ms max=724.19ms p(90)=177.53ms p(95)=222.04ms p(99)=331.92ms
+    iterations.....................: 33896  563.423351/s
+    vus............................: 51     min=51         max=51
+    vus_max........................: 51     min=51         max=51
+
+    NETWORK
+    data_received..................: 32 MB  525 kB/s
+    data_sent......................: 8.3 MB 139 kB/s
+
+
+

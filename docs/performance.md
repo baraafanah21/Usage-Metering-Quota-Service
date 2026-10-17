@@ -224,3 +224,56 @@ The 3 runs on each side varied by under 1 %, and verify.sql passed on all 6. The
 **Why the hold is still ~1.7 ms with one round trip.** Postgres releases row locks only after the commit record is flushed to disk (`synchronous_commit = on`), so the WAL flush is inside the hold. That flush is the floor for a durable single hot row on this machine. Turning `synchronous_commit` off would lower the floor, but an acknowledged consume could then be lost in a crash. Not considered.
 
 **Decision.** Not kept. The gain is real and large for **one** hot account (+73 %), but it costs a second implementation of the rules in SQL with its own tests, and the risk that the two engines drift apart. For one account, sharded counters (below) remove the single-row limit altogether rather than shortening it. If one account must exceed ~350 req/s before that work, this is the next step to build, and its number is now known. Results: [`load/results/step-5/`](../load/results/step-5/).
+
+### Before and after
+
+**Kept:** step 1 (locked section 5 → 3 round trips) and step 2 (BEGIN + timeouts in one round trip; one lookup query). A consume now makes **6 round trips, 3 of them under the account lock** (6a: 10 and 5). Not kept: the API key cache (step 3, no gain), a bigger pool (step 4, default stays 20) and the one-round-trip locked section (step 5, gain measured but needs the rules in SQL).
+
+**Interleaved A/B, 6a code against final code** (each pair run back to back, 3 pairs per scenario, every run on a fresh stack). This is the comparison to trust:
+
+| Scenario | 6a code req/s | Final req/s | Change | p99 ms (6a → final) | Lock hold ms (final) | DB CPU cores (6a → final) |
+| --- | --: | --: | --: | --: | --: | --: |
+| hot-account | 259 | 338 | **+30 %** | 715 → 544 | 2.55 | 0.95 → 1.07 |
+| spread | 1,916 | 2,178 | **+14 %** | 75 → 68 | 4.54 | 3.27 → 3.35 |
+| retry-storm | 3,255 | 2,979 | **−9 %** | 45 → 51 | – | 1.33 → 2.47 |
+
+**All six scenarios, `final` label** (3 runs each, fresh stack, `load/run-all.sh final 3`), next to the 6a baseline table. These ran in different sessions on the same laptop, so differences under ~15 % are within the drift measured between sessions (see the note at the top of Phase 6b):
+
+| Scenario | 6a req/s | Final req/s | 6a p50 / p95 / p99 ms | Final p50 / p95 / p99 ms | Errors | verify.sql (final) |
+| --- | --: | --: | --: | --: | --: | :-: |
+| spread | 1,841 | 2,196 | 52 / 70 / 80 | 44 / 56 / 67 | 0.00 % | ✅ 3/3 |
+| hot-account | 322 | 333 | 286 / 462 / 583 | 280 / 441 / 552 | 0.00 % | ✅ 3/3 |
+| hot-user | 296 | 331 | 315 / 507 / 639 | 282 / 443 / 556 | 0.00 % | ✅ 3/3 |
+| exhaust | 306 | 334 | 297 / 482 / 606 | 276 / 431 / 524 | 0.00 % | ✅ 3/3 |
+| retry-storm | 3,120 | 2,971 | 31 / 39 / 49 | 33 / 40 / 50 | 0.00 % | ✅ 3/3 |
+| plan-flip | 483 | 569 | 80 / 261 / 383 | 69 / 217 / 323 | 0.00 % | ✅ 3/3 |
+
+hot-account looks flat in this table (322 → 333) but +30 % in the A/B. The 6a baseline was recorded on a faster day: step 0, the same code as 6a, ran 279 req/s at the start of Phase 6b. The A/B removes that. exhaust accepted exactly 10,000 units and retry-storm wrote exactly 100 rows (300 units) in all 3 final runs.
+
+**The replay regression (retry-storm −9 %).** Since step 2, a replay runs the merged lookup, which also fetches the user and both plans, and costs 0.3 ms of planning against 0.06 ms for the old idempotency-only query. Postgres CPU in retry-storm nearly doubled (1.33 → 2.47 cores). New decisions gained more than replays lost, and in production replays are the rare retry path. But this is a real cost, and it is the first thing to fix next (see below). Results: [`load/results/final/`](../load/results/final/), [`load/results/ab-final/`](../load/results/ab-final/).
+
+**Correctness held.** The full API suite passes (198 tests). verify.sql passed on every one of the 123 Phase 6b runs kept in `load/results/` (every step, A/B and the final runs). Re-running the 3b/6a lock-removal mutation on the final code (both counter upserts made non-locking `ON CONFLICT DO NOTHING` + plain reads, in a scratch copy) still breaks it: exhaust accepted **1,019 requests, 10,190 units against an allowance of 10,000**. verify.sql failed with `ALLOWANCE FAILED`, the k6 `count==1000` thresholds failed, and run.sh exited 1.
+
+### The model, re-checked
+
+- **Per account: throughput ≈ 1 / lock hold.** At every step the measured hot-account req/s was 0.86–0.89 × (1 / lock hold metric): step 0 279 vs 314, step 1 375 vs 431, final 333 vs 386. The constant ratio is the metric starting on the lock statement's response, about a third of a millisecond after the lock was granted. The pool sweep confirms it from the other side: lock hold stays at 2.5–2.6 ms at 10–60 connections, and so does throughput. The step 5 prototype, at one round trip, fits too: 1 / 584 req/s = 1.7 ms, and that floor is mostly the commit's WAL flush.
+- **Many accounts: throughput ≈ pool size / connection hold.** It still adds up: 20 / 2,196 req/s = 9.1 ms ≈ 8.1 ms in the transaction + ~1 ms for the key query. But it is an identity (Little's law), not the cause. Above ~20 connections, the API's single JavaScript thread is the limit (93–98 % busy, flat at 1.1 cores in every spread run, and the pool sweep flattening at 40–60). 6a's "connection-bound, not API-bound" was wrong, and it is corrected above.
+
+### What we learned
+
+- **Round trips under the lock are what count for one account.** Removing two of them gave +34 % in the step and +30 % overall. Removing round trips elsewhere did nothing for hot-account (step 2 A/B: 351 vs 336).
+- **Measure planning, not only execution.** Merging two queries made the database do more work, and pg_stat_statements didn't show it. `EXPLAIN (SUMMARY)` did: 0.7 ms of planning, cut to 0.3 ms with `MATERIALIZED`.
+- **Event-loop lag doesn't detect a saturated Node process.** A per-thread CPU sample did. A metric for event-loop utilization would have caught it in 6a.
+- **This laptop drifts 10–15 % between sessions**, as much as some effects. Single before/after numbers from different sessions mislead (hot-account looks +3 %, interleaved it is +30 %). Every decision here that depended on a small difference was made with an interleaved A/B.
+- **A cache only helps if it removes work from the bottleneck.** The key lookup cost Postgres 0.008 ms and wasn't on either critical path.
+- **More connections make a hot account worse,** not better: same throughput, p99 2.7× from 10 to 60 connections, closer to the lock timeout.
+
+### What we would do next (not built)
+
+1. **Named prepared statements** (`pg` `{ name, text, values }`) for the consume queries, so Postgres plans each once per connection instead of on every call. That should undo the replay regression and lower DB CPU everywhere. Measure on retry-storm and spread.
+2. **More API instances** behind a load balancer, each with a pool of 20. spread is bound by one Node thread per instance; Postgres used ~3.4 of 16 cores. Mind `max_connections` (100): 4 instances × 20 = 80.
+3. **The one-round-trip locked section** (step 5): +73 % for one hot account, measured. It is worth building only together with a single source for the rules (for example, generating both checks from one definition) and tests that run both implementations against the same cases.
+4. **At larger scale, for one very hot account** (all three are design notes only):
+   - **Sharded counters:** N counter rows per account-month, and a consume locks one shard. Throughput ~N × per-row, but the monthly check then needs either a per-shard allowance or a sum over shards.
+   - **Pre-allocated quota slices:** an instance or user leases a block of allowance (say 1,000 units) with one locked update, then spends it locally and returns the remainder. Few lock acquisitions per request; the cost is unused leases until they are returned.
+   - **Ledger partitioning** by month (`usage_requests` grows forever), so history queries and index sizes stay bounded and old months can be archived. The unique `(account_id, request_id)` key would then need the month in it, or a separate idempotency table.
