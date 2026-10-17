@@ -57,12 +57,12 @@ All numbers below come from one laptop. **k6, the API and Postgres all run on it
 
 | Scenario | Req/s | p50 ms | p95 ms | p99 ms | Error rate | `db_pool_waiting` (avg) | `consume_tx_duration` mean ms | `consume_pool_acquire` mean ms | CPU cores db / api | verify.sql |
 | --- | --: | --: | --: | --: | --: | --: | --: | --: | --: | :-: |
-| spread | 1,841 | 52.2 | 69.5 | 80.0 | 0.00 % | 76.9 | 9.94 | 20.78 | 3.18 / 1.10 | ✅ 3/3 |
-| hot-account | 322 | 286.1 | 462.0 | 582.9 | 0.00 % | 78.6 | 61.89 | 122.53 | 0.82 / 0.43 | ✅ 3/3 |
-| hot-user | 296 | 314.8 | 507.1 | 638.8 | 0.00 % | 78.5 | 67.21 | 132.79 | 0.84 / 0.45 | ✅ 3/3 |
-| exhaust | 306 | 297.1 | 482.0 | 606.3 | 0.00 % | 65.9 | 64.35 | 125.68 | 0.72 / 0.50 | ✅ 3/3 |
-| retry-storm | 3,120 | 30.6 | 39.0 | 48.5 | 0.00 % | 73.5 | 5.13 | 11.77 | 1.29 / 1.15 | ✅ 3/3 |
-| plan-flip | 483 | 79.6 | 261.0 | 383.2 | 0.00 % | 29.8 | 41.04 | 29.93 | 1.05 / 0.53 | ✅ 3/3 |
+| spread | 1,841 | 52.2 | 69.5 | 80.0 | 0.00 % | 76.9 | 9.94 | 20.78 | 3.18 / 1.10 | passed 3/3 |
+| hot-account | 322 | 286.1 | 462.0 | 582.9 | 0.00 % | 78.6 | 61.89 | 122.53 | 0.82 / 0.43 | passed 3/3 |
+| hot-user | 296 | 314.8 | 507.1 | 638.8 | 0.00 % | 78.5 | 67.21 | 132.79 | 0.84 / 0.45 | passed 3/3 |
+| exhaust | 306 | 297.1 | 482.0 | 606.3 | 0.00 % | 65.9 | 64.35 | 125.68 | 0.72 / 0.50 | passed 3/3 |
+| retry-storm | 3,120 | 30.6 | 39.0 | 48.5 | 0.00 % | 73.5 | 5.13 | 11.77 | 1.29 / 1.15 | passed 3/3 |
+| plan-flip | 483 | 79.6 | 261.0 | 383.2 | 0.00 % | 29.8 | 41.04 | 29.93 | 1.05 / 0.53 | passed 3/3 |
 
 Spread between runs: spread 1,778–1,929 req/s, hot-account 285–326, hot-user 264–300, exhaust 274–310, retry-storm 3,009–3,248, plan-flip 470–493. Run 3 was the slowest for every lock-bound scenario (by about 10 %). That is laptop noise (the runs share the machine with the desktop), which is why the table uses medians.
 
@@ -84,7 +84,7 @@ Every consume makes **10 sequential round trips** to Postgres (counted in Phase 
 
 From `pg_stat_statements` in spread run 2 (no contention), executing all 10 statements takes about **0.4 ms of database time** per request (the means are 0.18 ms for the account counter upsert, 0.07 ms for the ledger insert, 0.03–0.04 ms for each of the others, and almost nothing for `BEGIN`/`SET`/`COMMIT`). Everything else is time between statements.
 
-### spread: the pool is full of connections waiting on round trips
+### spread: the pool is full, and the API thread is busy (corrected in Phase 6b)
 
 - The pool is saturated for the whole run: `db_pool_total` stays at its maximum of 20 and `db_pool_waiting` averages 77. With 100 VUs and 20 connections, about 80 requests are always queued for a connection.
 - Little's law: 1,841 req/s × (9.9 ms in the transaction + about 1 ms for the API-key query) ≈ 20 connections in use. **Throughput = pool size ÷ time each request holds a connection.**
@@ -119,6 +119,8 @@ What is **not** proven: how much of each ~1 ms round trip is the Docker network,
 3. Client latency at 100 VUs is mostly **queueing for a pool connection**, which is a symptom of 1 or 2.
 
 ## What Phase 6b should improve, and how it will be measured
+
+_Written before Phase 6b, as the plan. What actually happened is in [Phase 6b](#phase-6b-improvements): the API key cache gave nothing and was reverted, fewer round trips under the lock gave +30 % on hot-account, and the pool sweep confirmed the hot-account part of the expectation below but not the spread part._
 
 Each item from DESIGN.md §11.3 is one change, measured with `load/run-all.sh <label> 3` on this machine and compared with the table above. A change counts only if `verify.sql` passes in every run.
 
@@ -241,12 +243,12 @@ The 3 runs on each side varied by under 1 %, and verify.sql passed on all 6. The
 
 | Scenario | 6a req/s | Final req/s | 6a p50 / p95 / p99 ms | Final p50 / p95 / p99 ms | Errors | verify.sql (final) |
 | --- | --: | --: | --: | --: | --: | :-: |
-| spread | 1,841 | 2,196 | 52 / 70 / 80 | 44 / 56 / 67 | 0.00 % | ✅ 3/3 |
-| hot-account | 322 | 333 | 286 / 462 / 583 | 280 / 441 / 552 | 0.00 % | ✅ 3/3 |
-| hot-user | 296 | 331 | 315 / 507 / 639 | 282 / 443 / 556 | 0.00 % | ✅ 3/3 |
-| exhaust | 306 | 334 | 297 / 482 / 606 | 276 / 431 / 524 | 0.00 % | ✅ 3/3 |
-| retry-storm | 3,120 | 2,971 | 31 / 39 / 49 | 33 / 40 / 50 | 0.00 % | ✅ 3/3 |
-| plan-flip | 483 | 569 | 80 / 261 / 383 | 69 / 217 / 323 | 0.00 % | ✅ 3/3 |
+| spread | 1,841 | 2,196 | 52 / 70 / 80 | 44 / 56 / 67 | 0.00 % | passed 3/3 |
+| hot-account | 322 | 333 | 286 / 462 / 583 | 280 / 441 / 552 | 0.00 % | passed 3/3 |
+| hot-user | 296 | 331 | 315 / 507 / 639 | 282 / 443 / 556 | 0.00 % | passed 3/3 |
+| exhaust | 306 | 334 | 297 / 482 / 606 | 276 / 431 / 524 | 0.00 % | passed 3/3 |
+| retry-storm | 3,120 | 2,971 | 31 / 39 / 49 | 33 / 40 / 50 | 0.00 % | passed 3/3 |
+| plan-flip | 483 | 569 | 80 / 261 / 383 | 69 / 217 / 323 | 0.00 % | passed 3/3 |
 
 hot-account looks flat in this table (322 → 333) but +30 % in the A/B. The 6a baseline was recorded on a faster day: step 0, the same code as 6a, ran 279 req/s at the start of Phase 6b. The A/B removes that. exhaust accepted exactly 10,000 units and retry-storm wrote exactly 100 rows (300 units) in all 3 final runs.
 
