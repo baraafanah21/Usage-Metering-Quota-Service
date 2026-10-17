@@ -137,54 +137,46 @@ export async function listUsers(
   };
 }
 
+/** The columns of USER_WITH_PLANS_SQL. */
+export interface UserWithPlansRow extends UserRow {
+  up_name: string;
+  up_version: number;
+  up_monthly: string | null;
+  up_per_request: string | null;
+  ap_id: string;
+  ap_name: string;
+  ap_version: number;
+  ap_monthly: string | null;
+  ap_per_request: string | null;
+  month: string;
+}
+
 /**
- * The user plus both plans that apply to it (its own, and its account's), with rules, and
- * the current month, in one query. Consume reads exactly this inside its transaction.
+ * The SELECT behind findUserWithPlans: $1 = accountId, $2 = externalId, at most one row.
+ * Exported so consume can run it in the same round trip as its idempotency lookup.
  */
-export async function findUserWithPlans(
-  accountId: string,
-  externalId: string,
-  db: Queryable,
-): Promise<UserWithPlans | undefined> {
-  const { rows } = await db.query<{
-    id: string;
-    external_id: string;
-    plan_id: string;
-    created_at: Date;
-    up_name: string;
-    up_version: number;
-    up_monthly: string | null;
-    up_per_request: string | null;
-    ap_id: string;
-    ap_name: string;
-    ap_version: number;
-    ap_monthly: string | null;
-    ap_per_request: string | null;
-    month: string;
-  }>(
-    `SELECT u.id, u.external_id, u.plan_id, u.created_at,
-            up.name AS up_name, up.version AS up_version,
-            ur.monthly AS up_monthly, ur.per_request AS up_per_request,
-            ap.id AS ap_id, ap.name AS ap_name, ap.version AS ap_version,
-            ar.monthly AS ap_monthly, ar.per_request AS ap_per_request,
-            to_char(date_trunc('month', now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS month
-     FROM users u
-     JOIN accounts a ON a.id = u.account_id
-     JOIN plans up ON up.id = u.plan_id
-     JOIN plans ap ON ap.id = a.plan_id
-     CROSS JOIN LATERAL (
-       SELECT max("limit") FILTER (WHERE type = 'monthly_allowance')     AS monthly,
-              max("limit") FILTER (WHERE type = 'max_units_per_request') AS per_request
-       FROM plan_rules WHERE plan_id = up.id) ur
-     CROSS JOIN LATERAL (
-       SELECT max("limit") FILTER (WHERE type = 'monthly_allowance')     AS monthly,
-              max("limit") FILTER (WHERE type = 'max_units_per_request') AS per_request
-       FROM plan_rules WHERE plan_id = ap.id) ar
-     WHERE u.account_id = $1 AND u.external_id = $2`,
-    [accountId, externalId],
-  );
-  const r = rows[0];
-  if (!r) return undefined;
+export const USER_WITH_PLANS_SQL = `
+  SELECT u.id, u.external_id, u.plan_id, u.created_at,
+         up.name AS up_name, up.version AS up_version,
+         ur.monthly AS up_monthly, ur.per_request AS up_per_request,
+         ap.id AS ap_id, ap.name AS ap_name, ap.version AS ap_version,
+         ar.monthly AS ap_monthly, ar.per_request AS ap_per_request,
+         to_char(date_trunc('month', now() AT TIME ZONE 'UTC'), 'YYYY-MM-DD') AS month
+  FROM users u
+  JOIN accounts a ON a.id = u.account_id
+  JOIN plans up ON up.id = u.plan_id
+  JOIN plans ap ON ap.id = a.plan_id
+  CROSS JOIN LATERAL (
+    SELECT max("limit") FILTER (WHERE type = 'monthly_allowance')     AS monthly,
+           max("limit") FILTER (WHERE type = 'max_units_per_request') AS per_request
+    FROM plan_rules WHERE plan_id = up.id) ur
+  CROSS JOIN LATERAL (
+    SELECT max("limit") FILTER (WHERE type = 'monthly_allowance')     AS monthly,
+           max("limit") FILTER (WHERE type = 'max_units_per_request') AS per_request
+    FROM plan_rules WHERE plan_id = ap.id) ar
+  WHERE u.account_id = $1 AND u.external_id = $2`;
+
+export function toUserWithPlans(r: UserWithPlansRow): UserWithPlans {
   return {
     user: toUser(r),
     userPlan: {
@@ -201,4 +193,17 @@ export async function findUserWithPlans(
     },
     month: r.month,
   };
+}
+
+/**
+ * The user plus both plans that apply to it (its own, and its account's), with rules, and
+ * the current month, in one query.
+ */
+export async function findUserWithPlans(
+  accountId: string,
+  externalId: string,
+  db: Queryable,
+): Promise<UserWithPlans | undefined> {
+  const { rows } = await db.query<UserWithPlansRow>(USER_WITH_PLANS_SQL, [accountId, externalId]);
+  return rows[0] && toUserWithPlans(rows[0]);
 }

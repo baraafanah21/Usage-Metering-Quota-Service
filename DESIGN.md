@@ -335,13 +335,12 @@ sequenceDiagram
     participant P as Postgres
     C->>A: POST /v1/consume (X-API-Key, userId, units, requestId)
     A->>A: validate body, resolve key → accountId (LRU cache, 30s TTL)
-    A->>P: BEGIN
-    A->>P: SELECT ledger WHERE account_id, request_id
+    A->>P: BEGIN + SET LOCAL lock_timeout, statement_timeout (1 round trip)
+    A->>P: SELECT ledger row for (account_id, request_id) + user + user plan rules + account plan rules (1 query)
     alt already exists
         A->>P: COMMIT
         A-->>C: stored decision (replayed: true) or 409 if payload differs
     end
-    A->>P: SELECT user + user plan rules + account plan rules (1 query)
     alt user not in this account
         A-->>C: 404 USER_NOT_FOUND (nothing recorded)
     end

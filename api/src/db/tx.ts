@@ -11,16 +11,22 @@ export interface TxTiming {
   tx: number;
 }
 
+export interface TxOptions {
+  /** Statements to run right after BEGIN, sent with it in one round trip (no parameters). */
+  setup?: string;
+  /** Receives the timing once the transaction has ended, either way. */
+  observe?: (timing: TxTiming) => void;
+}
+
 /**
  * Runs fn inside BEGIN/COMMIT on one client. Any throw rolls back and is rethrown.
  * The client is always released; if ROLLBACK itself fails the connection is broken,
  * so it is destroyed instead of being returned to the pool.
- * `observe`, if given, receives the timing once the transaction has ended either way.
  */
 export async function withTransaction<T>(
   pool: Pool,
   fn: (client: PoolClient) => Promise<T>,
-  observe?: (timing: TxTiming) => void,
+  { setup, observe }: TxOptions = {},
 ): Promise<T> {
   const requested = performance.now();
   const client = await pool.connect();
@@ -35,7 +41,8 @@ export async function withTransaction<T>(
   };
   client.on("error", onError);
   try {
-    await client.query("BEGIN");
+    // A parameterless multi-statement string goes as one simple query: one round trip.
+    await client.query(setup ? `BEGIN; ${setup}` : "BEGIN");
     const result = await fn(client);
     await client.query("COMMIT");
     return result;

@@ -89,10 +89,10 @@ From `pg_stat_statements` in spread run 2 (no contention), executing all 10 stat
 - The pool is saturated for the whole run: `db_pool_total` stays at its maximum of 20 and `db_pool_waiting` averages 77. With 100 VUs and 20 connections, about 80 requests are always queued for a connection.
 - Little's law: 1,841 req/s × (9.9 ms in the transaction + about 1 ms for the API-key query) ≈ 20 connections in use. **Throughput = pool size ÷ time each request holds a connection.**
 - Of the ~10.9 ms a request holds a connection, the database spends ~0.4 ms executing SQL. The other **~96 % is the 10 round trips** (≈ 1 ms each) between the API and Postgres.
-- Neither side is out of CPU: Postgres uses 3.2 of 16 cores and the API 1.1. In the extra event-loop run (1,920 req/s), `nodejs_eventloop_lag_mean` stayed at 10.0–10.5 ms under load and 10.2 ms idle afterwards. That reading is the monitor's 10 ms resolution, with p99 at most 13.7 ms. So the Node main thread is not blocked, and the API process is not the limit at this load.
+- Postgres uses 3.2 of 16 cores. The API uses 1.1. Phase 6a concluded from event-loop lag that the API was not the limit. **That was wrong (corrected in Phase 6b, step 2):** sampling the node process's threads from `/proc` during spread shows the **main thread at 93–98 % of one core**. Event-loop lag stays near the monitor's 10 ms resolution when the loop is busy with many short callbacks, because no single callback blocks it for long. So it was the wrong signal for saturation. **spread is bound by the API's single JavaScript thread**, at about 0.5 ms of main-thread CPU per request.
 - Latency is mostly queueing: the server-side mean of 50.4 ms ≈ 2 × 19.8 ms pool acquire (the API-key query and the transaction each queue for a connection) + 9.5 ms transaction.
 
-What is **not** proven: how much of each ~1 ms round trip is the Docker network, the `pg` driver, or the event loop interleaving ~100 in-flight requests between `await`s. The data separates SQL time from time between statements, but not the parts of the latter.
+What is **not** proven: how much of each ~1 ms round trip is the Docker network, the `pg` driver, or waiting in the saturated event loop between `await`s. Phase 6b's thread sample suggests the event loop is a large part of it: each statement's reply waits behind other requests' callbacks.
 
 ### hot-account, hot-user, exhaust: one row lock serializes everything
 
@@ -115,7 +115,7 @@ What is **not** proven: how much of each ~1 ms round trip is the Docker network,
 ### Summary
 
 1. **Per account, the account row lock is the bottleneck** (hot-account, hot-user, exhaust: ~300 req/s). The lock is held for ~3.1 ms per request, ~87 % of it in the 5 round trips made while holding it, not in SQL.
-2. **Across accounts, the bottleneck is connections held during sequential round trips** (spread: 20 connections × ~10.9 ms each ≈ 1,840 req/s). Neither the database (3.2 of 16 cores) nor the API's event loop is saturated.
+2. **Across accounts, the bottleneck is the API's single JavaScript thread** (corrected in Phase 6b; 6a said connections held during round trips). 20 connections × ~10.9 ms each ≈ 1,840 req/s still holds by Little's law, but each connection is held that long largely because the event loop is busy. The database uses 3.2 of 16 cores.
 3. Client latency at 100 VUs is mostly **queueing for a pool connection**, which is a symptom of 1 or 2.
 
 ## What Phase 6b should improve, and how it will be measured
@@ -150,6 +150,7 @@ Method, for every step: change one thing, run the full API test suite, then run 
 | --- | --- | --: | --: | --: | --: | --: | --- |
 | 0 | Measure only: add `consume_lock_hold_seconds` | 279 | 1,845 | 286 | 3.18 | 71.2 / 9.9 | reference |
 | 1 | Lock both counter rows in one statement; increments + ledger insert in one statement | 375 | 1,982 | 350 | 2.32 | 53.1 / 9.1 | **kept** |
+| 2 | `BEGIN` + `SET LOCAL` in one round trip; idempotency and user lookups in one query | 335 (A/B: 336 vs step 1 351) | 2,167 | 341 | 2.57 (A/B: 2.56 vs 2.47) | 59.4 / 8.2 | **kept** (spread +9 %; hot-account unchanged, as expected) |
 
 ### Step 0: measure lock hold directly
 
@@ -162,3 +163,17 @@ Method, for every step: change one thing, run the full API test suite, then run 
 **Why it should help.** 6a found ~87 % of the 3.1 ms lock hold was round trips, and per-account throughput ≈ 1 / hold.
 
 **What happened.** Lock hold 3.18 → **2.32 ms** (−27 %); hot-account 279 → **375 req/s** (+34 %), exhaust 286 → 350 (+22 %); spread +7 % (two fewer round trips per connection-hold). 1 / 375 req/s = 2.67 ms against 2.32 ms measured: the model holds, with the metric reading ~0.3 ms low as expected. `pg_stat_statements`: the locked section's SQL is now 0.20 ms (record) after the lock statement. exhaust accepted exactly 10,000 in all 3 runs. Results: [`load/results/step-1/`](../load/results/step-1/).
+
+### Step 2: fewer round trips before the lock
+
+**Change.** `BEGIN` and the two `SET LOCAL` timeouts go to Postgres as one simple query (`withTransaction`'s `setup` option). `findConsumeContext` runs the idempotency lookup and the user + plans lookup in one query: both are CTEs, side by side in one row, and either may be empty. The SQL for the user lookup is shared with `findUserWithPlans`, so it exists once. `decide()` keeps the same order of checks: replay first, then unknown user. Per request: 8 → **6 round trips**, 3 of them under the lock (unchanged). The existing `SERVICE_BUSY` test fails if the timeouts are not applied (checked by removing them), so moving them into `BEGIN` is covered.
+
+**Why it should help.** These round trips are outside the lock, so hot-account should not move (per-account throughput ≈ 1 / lock hold). spread should gain, since each connection is held for less time.
+
+**What happened, attempt 1: a planning-time regression.** spread gained only 1 % (1,982 → 2,003) and **Postgres CPU in spread rose from 3.3 to 4.6 cores**. pg_stat_statements didn't show why, because it counts execution, not planning. `EXPLAIN (SUMMARY)` did: the merged query took **0.70 ms to plan**, against 0.13 + 0.06 ms for the two queries it replaced. Inlined, the two CTEs made the planner search join orders across ~9 relations at once. Results kept in [`load/results/step-2-unmaterialized/`](../load/results/step-2-unmaterialized/).
+
+**Attempt 2: `MATERIALIZED`.** Marking both CTEs `MATERIALIZED` makes Postgres plan them separately: 0.30 ms of planning. spread **2,167 req/s (+9 % over step 1)**, tx mean 9.1 → 8.2 ms, DB CPU back to 3.4 cores. This version is the one kept.
+
+**hot-account: no change, as the model predicts.** The three step-2 runs (281 / 335 / 344 req/s) looked worse than step 1, and attempt 1 had looked better (421). Neither makes sense for a change outside the lock, so I ran step 1 and step 2 interleaved on hot-account, 3 runs each: **step 1 351 req/s (lock hold 2.47 ms), step 2 336 (2.56 ms)**. That is the same within noise. The run-to-run and session-to-session swings (step 1 measured 375 earlier the same night) are as large as the effects here, which is why the final comparison is interleaved too. A/B results: [`load/results/ab-step1/`](../load/results/ab-step1/), [`load/results/ab-step2/`](../load/results/ab-step2/).
+
+**Finding that changes the 6a analysis.** During spread, the node process's main thread runs at 93–98 % of a core (`/proc/1/task/*/stat`, three 5 s windows). spread is bound by the API's single thread, not by Postgres. Removing statements helps spread mainly because every round trip costs that thread CPU (driver protocol work, promises, callbacks). The 6a sections above are corrected.

@@ -1,0 +1,2 @@
+DO
+psql:<stdin>:171: NOTICE:  verify OK: I5 + I6 + allowance over 1 account and 500 user counters, 24711 ledger rows, 24711 accepted snapshots
