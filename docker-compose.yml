@@ -31,6 +31,7 @@ services:
       ADMIN_API_KEY: *admin-api-key
       LOG_LEVEL: ${LOG_LEVEL:-info}
       DB_POOL_MAX: ${DB_POOL_MAX:-20}
+      API_KEY_CACHE_TTL_MS: ${API_KEY_CACHE_TTL_MS:-30000}
     ports:
       - "3000:3000"
     depends_on:

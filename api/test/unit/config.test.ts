@@ -13,6 +13,7 @@ describe("loadConfig", () => {
       PORT: 3000,
       LOG_LEVEL: "info",
       DB_POOL_MAX: 20,
+      API_KEY_CACHE_TTL_MS: 30_000,
     });
   });
 

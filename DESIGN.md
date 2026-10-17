@@ -411,7 +411,8 @@ Plans and assignments are read **inside** the consume transaction, with no cache
 | **Operator** | `X-Admin-Key` (from env `ADMIN_API_KEY`) | Create accounts (receives the account's first API key).           |
 | **Account**  | `X-API-Key: mk_<base62 32 bytes>`        | Everything about _its own_ account, plans, users, usage, history. |
 
-- **API key lifecycle:** generated with `crypto.randomBytes(32)`; shown **once** in the creation response; only `sha256` stored. Optional rotation: `POST /v1/account/api-keys` (new key) and `DELETE /v1/account/api-keys/:id` (revoke). Revoked keys fail immediately (cache entry removed on revoke; 30s TTL bounds staleness for multiple instances — documented).
+- **API key lifecycle:** generated with `crypto.randomBytes(32)`; shown **once** in the creation response; only `sha256` stored. Optional rotation (`POST /v1/account/api-keys`, `DELETE /v1/account/api-keys/:id`) is not built. Today a key is revoked by setting `api_keys.revoked_at` in the database.
+- **API key cache** (`src/http/apiKeyCache.ts`, Phase 6b): an in-process LRU from key hash to account id, at most 10,000 entries, each trusted for `API_KEY_CACHE_TTL_MS` (default 30 s; `0` turns it off). It saves the key lookup query on every request after the first. Only keys that were found are cached, so random keys can't fill it. **Staleness window:** a key revoked in the database keeps working on an instance that has it cached for up to the TTL, then gets `401 INVALID_API_KEY`. There is no revoke endpoint that could evict the entry, so this holds even with one instance. The test suite runs with the cache off, so a revoked key fails on the next request; `test/integration/auth.test.ts` checks the cached behaviour with a 300 ms TTL (still served right after revocation, refused once the entry expires).
 - **Enforcement point:** an Express `requireApiKey` middleware, mounted on the `/v1` router before every account route, resolves the key → `req.accountId` (typed through a `Request` declaration merge). A separate `requireAdminKey` middleware guards `/v1/admin`. Missing → `401 MISSING_API_KEY`; unknown/revoked → `401 INVALID_API_KEY` (same response timing; no hint which).
 - **Tenant scoping rule:** the account id **never comes from the URL or body**. Every repository function takes `accountId` as its first parameter and every query has `WHERE account_id = $1`. Users are addressed by `externalId`, resolved as `WHERE account_id = $1 AND external_id = $2`.
 - **Auth runs before routing.** `requireApiKey` is mounted on the whole `/v1` router, so an unknown path under `/v1` returns `401 MISSING_API_KEY` without a key, and `404 NOT_FOUND` only once a valid key is sent. Without a key, a caller can't use 404-vs-401 to discover which routes exist. `/v1/admin/*` has its own guard and its own 404, so it never falls through to the account-key guard.
@@ -731,7 +732,7 @@ Each test file uses a fresh account (new UUIDs), so tests can run in parallel wi
 ## 17. Known Limitations (honest list for the review)
 
 - Per-account throughput is capped by a single hot row (§11.4).
-- API-key cache can serve a revoked key for up to 30 s on _other_ instances (single instance here: revocation is immediate).
+- The API key cache serves a revoked key for up to `API_KEY_CACHE_TTL_MS` (default 30 s) on every instance that has it cached, this one included, because revocation is a database update with no eviction (§7). Set the TTL to `0` where that matters more than one query per request.
 - Requests in flight during a plan update may use the previous version (§6.5) — recorded, not hidden.
 - Ledger is unpartitioned; idempotency keys are kept forever.
 - No rate limiting of the API itself (different from quota), no RBAC, no billing.

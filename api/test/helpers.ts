@@ -15,7 +15,10 @@ export const ADMIN_KEY = config.ADMIN_API_KEY;
 export function setupTestApp({ poolMax = 5 }: { poolMax?: number } = {}): { pool: Pool; app: Express } {
   const pool = createPool({ connectionString: config.DATABASE_URL, max: poolMax }, logger);
   afterAll(() => pool.end());
-  return { pool, app: createApp({ pool, logger, adminApiKey: ADMIN_KEY }) };
+  return {
+    pool,
+    app: createApp({ pool, logger, adminApiKey: ADMIN_KEY, apiKeyCacheTtlMs: config.API_KEY_CACHE_TTL_MS }),
+  };
 }
 
 export interface TestAccount {

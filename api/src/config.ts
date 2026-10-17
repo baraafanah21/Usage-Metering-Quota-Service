@@ -12,6 +12,8 @@ const envSchema = z.object({
     .enum(["fatal", "error", "warn", "info", "debug", "trace", "silent"])
     .default("info"),
   DB_POOL_MAX: z.coerce.number().int().min(1).max(100).default(20),
+  // How long a resolved API key is trusted without asking the database (§7); 0 = no cache.
+  API_KEY_CACHE_TTL_MS: z.coerce.number().int().min(0).max(300_000).default(30_000),
 });
 
 export type Config = z.infer<typeof envSchema>;

@@ -1,6 +1,7 @@
 import express, { type Express, Router } from "express";
 import type { Pool } from "pg";
 import type { Logger } from "pino";
+import { createApiKeyCache } from "./http/apiKeyCache.js";
 import { requireAdminKey, requireApiKey } from "./http/middleware/auth.js";
 import { errorHandler, notFoundHandler } from "./http/middleware/errors.js";
 import { httpMetrics } from "./http/middleware/httpMetrics.js";
@@ -19,10 +20,12 @@ export interface AppDeps {
   pool: Pool;
   logger: Logger;
   adminApiKey: string;
+  /** API key cache TTL (§7). 0 or omitted: every request looks its key up. */
+  apiKeyCacheTtlMs?: number;
 }
 
 /** Builds the Express app without listening, so tests can drive it in-process with supertest. */
-export function createApp({ pool, logger, adminApiKey }: AppDeps): Express {
+export function createApp({ pool, logger, adminApiKey, apiKeyCacheTtlMs = 0 }: AppDeps): Express {
   const app = express();
 
   app.disable("x-powered-by");
@@ -38,7 +41,7 @@ export function createApp({ pool, logger, adminApiKey }: AppDeps): Express {
   // Admin first: it has its own guard and must not require an account API key.
   v1.use("/admin", requireAdminKey(adminApiKey), adminRouter(pool));
   // Everything else under /v1 belongs to an account.
-  v1.use(requireApiKey(pool));
+  v1.use(requireApiKey(pool, createApiKeyCache(apiKeyCacheTtlMs)));
   v1.use("/account", accountRouter(pool));
   v1.use("/plans", plansRouter(pool));
   v1.use("/users", usersRouter(pool));

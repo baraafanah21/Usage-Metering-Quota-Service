@@ -1,7 +1,8 @@
 import request from "supertest";
 import { beforeAll, describe, expect, it } from "vitest";
+import { createApp } from "../../src/app.js";
 import { generateApiKey } from "../../src/domain/apiKeys.js";
-import { ADMIN_KEY, createTestAccount, expectProblem, setupTestApp, type TestAccount } from "../helpers.js";
+import { ADMIN_KEY, createTestAccount, expectProblem, logger, setupTestApp, type TestAccount } from "../helpers.js";
 
 const { pool, app } = setupTestApp();
 
@@ -34,6 +35,22 @@ describe("requireApiKey", () => {
     await pool.query("UPDATE api_keys SET revoked_at = now() WHERE account_id = $1", [account.id]);
 
     expectProblem(await getAccount(account.apiKey), 401, "INVALID_API_KEY");
+  });
+
+  it("with the API key cache on, a revoked key stops working within the TTL", async () => {
+    const ttlMs = 300;
+    const cachedApp = createApp({ pool, logger, adminApiKey: ADMIN_KEY, apiKeyCacheTtlMs: ttlMs });
+    const account = await createTestAccount(app);
+    expect((await request(cachedApp).get("/v1/account").set("X-API-Key", account.apiKey)).status).toBe(200);
+
+    await pool.query("UPDATE api_keys SET revoked_at = now() WHERE account_id = $1", [account.id]);
+    const revokedAt = Date.now();
+
+    // The staleness window (DESIGN.md §7, §17): this instance still trusts its cached entry.
+    expect((await request(cachedApp).get("/v1/account").set("X-API-Key", account.apiKey)).status).toBe(200);
+    // Once the entry has expired, the key is looked up again and refused.
+    await new Promise((resolve) => setTimeout(resolve, ttlMs - (Date.now() - revokedAt) + 50));
+    expectProblem(await request(cachedApp).get("/v1/account").set("X-API-Key", account.apiKey), 401, "INVALID_API_KEY");
   });
 
   it("the admin key does not authenticate account routes", async () => {
