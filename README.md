@@ -2,6 +2,10 @@
 
 An HTTP service that a client application calls before it processes a unit of work (for example a document). The service decides whether the account and the user still have quota for the request. Each account and each user has a plan with a monthly allowance and a per-request limit. A request is accepted only if both levels allow it. Every decision, accepted or rejected, is recorded in a ledger. The service is built with TypeScript, Express 5 and PostgreSQL 16. The database enforces correctness when many requests arrive at once. [DESIGN.md](DESIGN.md) has the full design.
 
+![The demo's guided scenario: alice is rejected by her user limit, carol by the shared account limit, then a configuration change lets both through](docs/media/scenario.gif)
+
+The demo's guided scenario (see [Demo app](#demo-app)). A one-minute video that also shows a retry and the request history: [docs/media/demo.mp4](docs/media/demo.mp4). The captions and cursor were added at recording time; they aren't part of the app.
+
 ## Review in 10 minutes
 
 ```sh
@@ -628,7 +632,7 @@ The brief leaves these open; this is how the service behaves, and why. The same 
 │   └── test/             unit, integration and concurrency tests
 ├── demo-app/             the example client: its own server, one static page, the smoke test
 ├── load/                 k6 scenarios, setup, verify.sql, run scripts, results of every run
-├── docs/                 performance.md, api-examples.sh
+├── docs/                 performance.md, api-examples.sh, media/ (the demo GIF and video)
 ├── docker-compose.yml    db, api, demo; profiles test (db-test) and loadtest (k6)
 └── DESIGN.md             the full design
 ```
