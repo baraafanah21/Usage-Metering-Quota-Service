@@ -340,7 +340,7 @@ sequenceDiagram
     participant A as API
     participant P as Postgres
     C->>A: POST /v1/consume (X-API-Key, userId, units, requestId)
-    A->>P: resolve key → accountId (1 query; no cache, §7)
+    A->>P: resolve key → accountId (1 query, no cache, §7)
     A->>A: validate body
     A->>P: BEGIN + SET LOCAL lock_timeout, statement_timeout (1 round trip)
     A->>P: SELECT ledger row for (account_id, request_id) + user + user plan rules + account plan rules (1 query)
