@@ -93,14 +93,14 @@ curl -s -X POST localhost:3000/v1/admin/accounts \
               "version": 1, "rules": { "monthlyAllowance": 10000, "maxUnitsPerRequest": 100 }, … },
     "currentMonth": { "month": "2026-10", "used": 0, "remaining": 10000 }
   },
-  "apiKey": { "id": "c51e13f4-…", "key": "mk_5GL3gWqBtC0ZFExuENCgdJWWoSFlrrbvhHVrZ7zFM3U", "prefix": "mk_5GL3", "createdAt": "…" }
+  "apiKey": { "id": "c51e13f4-…", "key": "mk_…", "prefix": "mk_5GL3", "createdAt": "…" }
 }
 ```
 
 **Use the key** in the `X-API-Key` header on every `/v1` call. The examples below assume:
 
 ```sh
-KEY=mk_5GL3gWqBtC0ZFExuENCgdJWWoSFlrrbvhHVrZ7zFM3U   # the apiKey.key from your response
+KEY=mk_...   # the apiKey.key from your response
 ```
 
 A new account is on Starter unless the request names another predefined account plan (`{"name": "...", "planId": "..."}`). An account can switch to its own custom plan afterwards.
@@ -617,7 +617,7 @@ The brief leaves these open; this is how the service behaves, and why. The same 
 - **No key rotation or revocation endpoint.** An account has the one key it got at creation; revoking it means setting `revoked_at` in the database.
 - **The performance numbers come from one laptop with k6 on the same machine**, and vary 10–15 % between sessions.
 - **Replays got 9 % slower in Phase 6b** (`retry-storm`), because the merged lookup costs Postgres more planning. Named prepared statements are the likely fix (not built).
-- The optional `daily_allowance` rule ([DESIGN.md §5.1](DESIGN.md#51-optional-extra-rule-not-built)) is designed but **not built**.
+- The optional `daily_allowance` rule ([DESIGN.md §5.1](DESIGN.md#51-optional-extra-rule-not-built)) is designed but **not built**. No rules beyond the two required ones were added, to keep the core reliable first. If built, `daily_allowance` would be one more rule a plan may set at the account or user level, checked against a per-day counter. Like the others, every rule of both plans must pass, and a user's daily allowance never adds to the account's.
 
 ## Repository layout
 
