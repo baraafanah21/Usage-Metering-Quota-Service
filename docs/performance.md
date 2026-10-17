@@ -152,6 +152,7 @@ Method, for every step: change one thing, run the full API test suite, then run 
 | 1 | Lock both counter rows in one statement; increments + ledger insert in one statement | 375 | 1,982 | 350 | 2.32 | 53.1 / 9.1 | **kept** |
 | 2 | `BEGIN` + `SET LOCAL` in one round trip; idempotency and user lookups in one query | 335 (A/B: 336 vs step 1 351) | 2,167 | 341 | 2.57 (A/B: 2.56 vs 2.47) | 59.4 / 8.2 | **kept** (spread +9 %; hot-account unchanged, as expected) |
 | 3 | API key cache (in-process LRU, 30 s TTL) | 320 | 2,190 (A/B: 2,204 vs step 2 2,223) | 334 | 2.67 | 62.4 / 9.1 | **reverted**: no gain |
+| 4 | Pool size sweep `DB_POOL_MAX` 10 / 20 / 40 / 60 | 356 / 334 / 325 / 326 | 1,701 / 2,190 / 2,361 / 2,399 | – | 2.48 / 2.58 / 2.63 / 2.64 | 27.8 / 59.6 / 122.6 / 183.3 (hot-account) | **default stays 20** |
 
 ### Step 0: measure lock hold directly
 
@@ -188,3 +189,20 @@ Method, for every step: change one thing, run the full API test suite, then run 
 **What happened.** The cache worked: API key lookups fell from ~130,000 to 539 per spread run. Throughput didn't move: spread 2,190 req/s in the step-3 runs, and in an interleaved A/B, **step 2 2,223 vs step 3 2,204 req/s** (medians of 3). hot-account (320) and exhaust (334) were within noise of step 2. API CPU dropped slightly (1.11 → 1.07 cores). The mean pool acquire doubled (17 → 34 ms), but that is not a slowdown. Each request now queues for the pool once instead of twice, so the same total wait lands on one acquire. The key lookup costs Postgres 0.008 ms and the API thread very little, and neither bottleneck (the API thread for spread, the lock for hot-account) shrinks when it goes.
 
 **Decision: reverted.** No measurable gain, and the cache would let a revoked key keep working for up to 30 s. DESIGN.md §7 now says there is no cache. It had described one, with eviction on a revoke endpoint that doesn't exist. Results: [`load/results/step-3/`](../load/results/step-3/), [`ab-spread-step2/`](../load/results/ab-spread-step2/), [`ab-spread-step3/`](../load/results/ab-spread-step3/).
+
+### Step 4: pool size sweep
+
+**Method.** The code from step 2/3. spread and hot-account at `DB_POOL_MAX` 10, 20, 40 and 60, 3 runs each (24 runs, every one on a fresh stack). The pool sizes were interleaved within each round (10, 20, 40, 60, then again), so drift during the half hour hit every size alike. Postgres `max_connections` is 100 (the compose default).
+
+| `DB_POOL_MAX` | spread req/s | spread p99 ms | API CPU (cores) | hot-account req/s | hot-account p95 / p99 ms | hot-account tx mean ms | Lock hold ms | `db_pool_waiting` (hot-account) |
+| --: | --: | --: | --: | --: | --: | --: | --: | --: |
+| 10 | 1,701 | 79.9 | 0.93 | 356 | 355 / 420 | 27.8 | 2.48 | 88 |
+| 20 | 2,190 | 68.6 | 1.11 | 334 | 438 / 555 | 59.6 | 2.58 | 78 |
+| 40 | 2,361 | 60.5 | 1.13 | 325 | 603 / 854 | 122.6 | 2.63 | 59 |
+| 60 | 2,399 | 61.1 | 1.13 | 326 | 778 / 1,145 | 183.3 | 2.64 | 39 |
+
+**hot-account: confirmed lock-bound.** Throughput is flat within noise (326–356 req/s) and the lock hold barely moves (2.48–2.64 ms), so per-account throughput ≈ 1 / lock hold whatever the pool. More connections move requests from the pool queue into the lock queue. `db_pool_waiting` falls (88 → 39), but every transaction then waits longer for the row (tx mean 28 → 183 ms), and the tail grows: **p99 420 → 1,145 ms**. At 60 connections the p99 is more than half of the 2 s `lock_timeout`, past which requests fail with `503 SERVICE_BUSY`.
+
+**spread: scales only partly.** 10 → 20 connections: +29 %. 20 → 40: +8 %. 40 → 60: +2 %. It stops where the API's single thread is full: the API uses 1.11–1.13 cores from 20 connections up. That fits step 2's finding. Connections are the limit below 20, and the API thread is the limit above it. So the 6a expectation ("spread scales with the pool") holds only up to ~20–40.
+
+**Default: 20 (unchanged).** 40 would buy spread +8 %, but it would cost a hot account +54 % at p99 and bring it closer to the lock timeout. It would also use 40 of Postgres's 100 connections per API instance. Since the API thread is spread's limit above 20, more instances (each with its own thread and a pool of 20) is the better way to scale than more connections per instance. No code change in this step. Results: [`load/results/step-4/`](../load/results/step-4/) (`pool-<n>/summary.md` for each size).

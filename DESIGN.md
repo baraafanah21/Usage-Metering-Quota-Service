@@ -617,7 +617,7 @@ After every run a **verification script** (`load/verify.sql`) checks over the wh
 3. **Fewer round trips:** user + both plans' rules in one query; counter upsert+lock merged (`INSERT … ON CONFLICT DO UPDATE … RETURNING`).
 4. **Stateless pre-check before locks** (already in design; measure the gain on the oversized-request mix).
 5. **Single round trip:** move the locked section into one SQL statement (data-modifying CTE) or a PL/pgSQL function → the lock is held for ~one network round trip less. Compare honestly; keep it only if the gain justifies moving logic into SQL.
-6. **Pool size tuning:** sweep `max` (5/10/20/50) and show where more connections stop helping (contention, not connections, is the limit).
+6. **Pool size tuning:** sweep `max` (5/10/20/50) and show where more connections stop helping (contention, not connections, is the limit). _Done in Phase 6b (10/20/40/60): one hot account is flat at every size, and only its tail latency grows; many accounts gain up to ~40, then the API's single thread is the limit. Default kept at 20._
 
 Results table per iteration: RPS, p50/p95/p99, error rate, invariant check ✅/❌, plus a short "what we learned".
 
